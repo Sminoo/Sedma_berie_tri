@@ -245,7 +245,7 @@ class StateManager:
         self.local_player: Optional[int] = None
         self.game_state: Optional[Dict] = None
         self.player_names: Dict[int, str] = {}
-        self.num_players: int = 4               # ← added - default value
+        self.num_players: int = 4
         self.waiting_message: Optional[str] = None
         self.waiting_start: float = time.time()
         self.leaderboard_start: float = 0
@@ -471,6 +471,8 @@ class Renderer:
             self.screen.blit(players_surface, (room_rect.x + 10, room_rect.y + 50))
 
             y_offset += room_item_height
+
+
 
     def render_game(self, state_manager: StateManager, card_sprites: Dict[int, pygame.sprite.Group],
                     current_room_name: str, mouse_pos: Tuple[int, int], waiting_message: Optional[str]) -> None:
@@ -843,6 +845,7 @@ class EventHandler:
             self.state_manager.local_player = message.get("player_slot", 0)
             self.state_manager.player_names[self.state_manager.local_player] = self.player_name
             print(f"[DEBUG] Set local player {self.state_manager.local_player} name: {self.player_name}")
+            self.update_card_sprites()
             self.state_manager.state = "room_waiting"
             self.state_manager.waiting_message = f"Joined room: {self.current_room_name}"
 
@@ -863,8 +866,6 @@ class EventHandler:
             self.state_manager.waiting_message = (
                 f"Waiting for {players_needed} more player(s)..."
             )
-
-
 
 
         elif msg_type == "gs":
@@ -912,31 +913,40 @@ class EventHandler:
         if not self.state_manager.game_state or self.state_manager.local_player is None:
             return
 
-        # Use actual number of players instead of 4
-        for i in range(self.state_manager.num_players):
-            hand = self.state_manager.game_state["players"][i]
+        num_players = self.state_manager.num_players
+
+        # Force-clear ALL sprite groups every time we get a new game state
+        # This is the safest way — prevents any stale data from previous games
+        for i in range(num_players):
+            self.card_sprites[i].empty()
+
+        # Now rebuild everything fresh
+        for i in range(num_players):
+            hand = self.state_manager.game_state.get("players", [])[i]
             if not hand:
-                self.card_sprites[i].empty()
                 continue
 
-            pos_index = (i - self.state_manager.local_player) % self.state_manager.num_players
-            current_sprites = list(self.card_sprites[i].sprites())
+            pos_index = (i - self.state_manager.local_player) % num_players
+            is_local = (i == self.state_manager.local_player)
 
-            if len(current_sprites) != len(hand):
-                self.card_sprites[i].empty()
-                is_local = (i == self.state_manager.local_player)
-                for j, card_data in enumerate(hand):
-                    card_key = card_data["name"]
-                    if card_key not in self.card_cache:
-                        self.card_cache[card_key] = Card(card_data["name"], card_data["value"], card_data["suit"])
-                    card = self.card_cache[card_key]
-                    x, y, angle = self.layout.get_player_position(
-                        pos_index, len(hand), j, is_local=is_local
+            for j, card_data in enumerate(hand):
+                card_key = card_data["name"]
+                if card_key not in self.card_cache:
+                    self.card_cache[card_key] = Card(
+                        card_data["name"],
+                        card_data["value"],
+                        card_data["suit"]
                     )
-                    back_card = self.card_cache.get("back", Card("back", 0, ""))
-                    sprite = CardSprite(card if is_local else back_card, x, y, angle)
-                    self.card_sprites[i].add(sprite)
+                card = self.card_cache[card_key]
 
+                x, y, angle = self.layout.get_player_position(
+                    pos_index, len(hand), j, is_local=is_local
+                )
+
+                # Use real card for yourself, back for others
+                display_card = card if is_local else self.card_cache.get("back", Card("back", 0, ""))
+                sprite = CardSprite(display_card, x, y, angle)
+                self.card_sprites[i].add(sprite)
 
 class MultiRoomClient:
     def __init__(self):
@@ -979,10 +989,10 @@ class MultiRoomClient:
         self.event_handler = EventHandler(self.network, self.state_manager, self.renderer, self.layout,
                                           self.input_fields, self.ui_elements)
 
-        self.card_sprites: Dict[int, pygame.sprite.Group] = self.event_handler.card_sprites
+
         self.running: bool = True
 
-        # Initial asset load
+        #Initial asset load
         self.renderer.load_assets(
             self.renderer.current_background_path,
             self.renderer.current_card_back_path,
@@ -1000,14 +1010,18 @@ class MultiRoomClient:
         self.connect_button_rect = pygame.Rect(SCREEN_WIDTH // 2 - 75, SCREEN_HEIGHT // 2 - 10, 150, 40)
         self.close_button_rect = pygame.Rect(SCREEN_WIDTH // 2 - 75, SCREEN_HEIGHT // 2 + 50, 150, 40)
 
-        # Left-side lobby controls
         self.create_room_button_rect = pygame.Rect(50, 150, 200, 40)
-        # moved down to avoid overlap with create button and selector
         self.room_name_input_rect = pygame.Rect(50, 260, 200, 40)
         self.refresh_button_rect = pygame.Rect(50, 320, 200, 40)
         self.disconnect_button_rect = pygame.Rect(50, SCREEN_HEIGHT - 60, 200, 40)
 
         self.leave_room_button_rect = pygame.Rect(50, SCREEN_HEIGHT - 60, 150, 40)
+
+    def _reset_render_game(self):
+        self.card_sprites = {i: pygame.sprite.Group() for i in range(4)}
+        self.card_rects = []
+        self.card_cache = {}
+        self.state_manager.render_debug_done = False
 
     def run(self) -> None:
         clock = pygame.time.Clock()
@@ -1046,6 +1060,7 @@ class MultiRoomClient:
                 self.ui_elements["customize"].draw(self.screen, mouse_pos)
 
             elif self.state_manager.state == "lobby":
+                self.card_sprites: Dict[int, pygame.sprite.Group] = self.event_handler.card_sprites
                 self.renderer.render_lobby(
                     self.renderer.current_background_path,
                     self.event_handler.player_name,
@@ -1058,6 +1073,7 @@ class MultiRoomClient:
                 )
 
             elif self.state_manager.state in ["room_waiting", "playing"]:
+
                 self.renderer.render_game(
                     self.state_manager,
                     self.card_sprites,
