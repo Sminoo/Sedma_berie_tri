@@ -216,7 +216,7 @@ class InputField:
         self.active = False
         self.max_len = max_len
 
-    def draw(self, screen: pygame.Surface, mouse_pos: Tuple[int, int]) -> None:
+    def draw(self, screen: pygame.Surface) -> None:
         bg_color = BUTTON_HOVER_COLOR if self.active else self.bg_color
         pygame.draw.rect(screen, bg_color, self.rect)
         display_text = self.text or self.placeholder
@@ -989,10 +989,8 @@ class MultiRoomClient:
         self.event_handler = EventHandler(self.network, self.state_manager, self.renderer, self.layout,
                                           self.input_fields, self.ui_elements)
 
-
         self.running: bool = True
 
-        #Initial asset load
         self.renderer.load_assets(
             self.renderer.current_background_path,
             self.renderer.current_card_back_path,
