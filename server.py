@@ -331,138 +331,79 @@ class MessageHandler:
 
             if not (3 <= len(room_name) <= 30):
                 self.server.send_message(sock, {"t": "e", "msg": "Room name must be 3-30 characters long"})
-
                 return
 
-            # Read and validate requested max players (default to server constant)
-
             try:
-
                 max_players = int(message.get("max_players", MAX_PLAYERS_PER_ROOM))
-
             except (ValueError, TypeError):
-
                 max_players = MAX_PLAYERS_PER_ROOM
-
             if not (2 <= max_players <= MAX_PLAYERS_PER_ROOM):
-                self.server.send_message(sock,
-                                         {"t": "e", "msg": f"max_players must be between 2 and {MAX_PLAYERS_PER_ROOM}"})
-
+                self.server.send_message(sock,{"t": "e", "msg": f"max_players must be between 2 and {MAX_PLAYERS_PER_ROOM}"})
                 return
 
             room_id = self.rooms.create_room(sock, room_name, creator_name, max_players)
-
             if room_id:
-
                 self.server.lobby.remove_client(sock)
-
                 self.server.lobby.player_room_created[creator_name] = True
-
                 print(
                     f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Room '{room_name}' ({max_players} players) created by {creator_name}")
-
                 self.server.send_message(sock, {
-
                     "t": "room_joined",
-
                     "room_id": room_id,
-
                     "room_name": room_name,
-
                     "player_slot": 0,
-
                     "max_players": max_players
-
                 })
-
                 self.lobby.broadcast({"t": "room_list_update", "rooms": self.rooms.get_available_rooms_info()}, sock,
                                      self.server)
-
             else:
-
                 self.server.send_message(sock, {"t": "e",
                                                 "msg": f"Failed to create room (max {MAX_ROOMS} rooms or invalid parameters)"})
-
-
         elif msg_type == "join_room":
-
             if sock not in self.server.client_names:
                 self.server.send_message(sock, {"t": "e", "msg": "Please set your name first"})
-
                 return
 
             room_id = message.get("room_id")
-
             slot = self.rooms.join_room(sock, room_id, self.server.client_names[sock])
 
             if slot is not None:
-
                 self.server.lobby.remove_client(sock)
-
                 player_name = self.server.client_names[sock]
-
                 room = self.rooms.rooms[room_id]
-
                 players_count = len([p for p in room.players if p])
-
                 print(
                     f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {player_name} joined room '{room.room_name}' as Player {slot + 1}")
-
                 self.server.send_message(sock, {
-
                     "t": "room_joined",
-
                     "room_id": room_id,
-
                     "room_name": room.room_name,
-
                     "player_slot": slot,
-
                     "max_players": room.max_players
-
                 })
 
                 self.rooms.broadcast_to_room(room_id, {
-
                     "t": "player_joined",
-
                     "player_name": player_name,
-
                     "player_slot": slot,
-
                     "players_count": players_count
-
                 }, exclude_sock=None, server=self.server)
 
                 if room.can_start_game():
-
                     room.start_game()
-
                     self._broadcast_game_state(room_id)
-
                 else:
-
                     players_needed = room.max_players - players_count
-
                     self.rooms.broadcast_to_room(room_id, {
-
                         "t": "waiting",
-
                         "players_needed": players_needed
-
                     }, exclude_sock=None, server=self.server)
-
                 self.lobby.broadcast({"t": "room_list_update", "rooms": self.rooms.get_available_rooms_info()},
-
                                      server=self.server)
-
             else:
-
                 self.server.send_message(sock, {"t": "e", "msg": "Failed to join room"})
-
         elif msg_type == "refresh_rooms":
             self.lobby.send_room_list(sock, self.rooms.rooms, self.server)
-
     def handle_room_message(self, sock: socket.socket, message: dict) -> None:
         room_id = self.rooms.client_rooms.get(sock)
         if room_id not in self.rooms.rooms:

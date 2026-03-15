@@ -365,11 +365,11 @@ class Renderer:
 
         ip_label = self.font.render("Server IP:", True, TEXT_COLOR)
         self.screen.blit(ip_label, (ip_field.rect.x, ip_field.rect.y - 30))
-        ip_field.draw(self.screen, pygame.mouse.get_pos())
+        ip_field.draw(self.screen)
 
         name_label = self.font.render("Your Name:", True, TEXT_COLOR)
         self.screen.blit(name_label, (name_field.rect.x, name_field.rect.y - 30))
-        name_field.draw(self.screen, pygame.mouse.get_pos())
+        name_field.draw(self.screen)
 
         mouse_pos = pygame.mouse.get_pos()
         connect_btn.draw(self.screen, mouse_pos)
