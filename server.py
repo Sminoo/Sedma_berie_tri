@@ -35,6 +35,25 @@ def get_local_ip() -> str:
         logger.error(f"Failed to get local IP: {e}")
         return "Unknown"
 
+def get_public_ip() -> str:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.connect(("ifconfig.co", 80))
+            request = "GET /ip HTTP/1.1\r\nHost: ifconfig.co\r\nConnection: close\r\n\r\n"
+            s.sendall(request.encode())
+            response = b""
+            while True:
+                data = s.recv(1024)
+                if not data:
+                    break
+                response += data
+        response_str = response.decode()
+        ip_line = response_str.split("\r\n")[-1].strip()
+        return ip_line
+    except Exception as e:
+        logger.error(f"Failed to get public IP: {e}")
+        return "Unknown"
+
 
 @dataclass
 class Player:
