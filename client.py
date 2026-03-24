@@ -393,7 +393,7 @@ class Renderer:
 
         create_label = self.font.render("Create Room:", True, TEXT_COLOR)
         self.screen.blit(create_label, (50, 120))
-        room_name_field.draw(self.screen, pygame.mouse.get_pos())
+        room_name_field.draw(self.screen)
 
         mouse_pos = pygame.mouse.get_pos()
         create_btn.draw(self.screen, mouse_pos)
