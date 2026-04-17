@@ -14,6 +14,7 @@ import argparse
 import zlib
 import uuid
 import time
+import random
 import logging
 from typing import Dict, List, Optional, Set
 from dataclasses import dataclass
@@ -30,7 +31,6 @@ MAX_PLAYERS_PER_ROOM = 4
 
 
 def get_local_ip() -> str:
-    """Detect the local network IP address."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -43,27 +43,27 @@ def get_local_ip() -> str:
 
 
 def timestamp() -> str:
-    """Return formatted current timestamp."""
     return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
 
 @dataclass
 class Player:
-    """Represents a connected player."""
     sock: socket.socket
     name: str
     slot: int
 
 
 class GameRoom:
-    """A game room that holds players and manages game lifecycle."""
-
     def __init__(self, room_id: str, room_name: str, creator: Player,
-                 max_players: int = MAX_PLAYERS_PER_ROOM):
+                 max_players: int = MAX_PLAYERS_PER_ROOM, rules: dict = None,
+                 is_private: bool = False, password: str = None):
         self.room_id = room_id
         self.room_name = room_name
         self.creator = creator
         self.max_players = max_players
+        self.rules = rules or {}
+        self.is_private = is_private
+        self.password = password
         self.game: Optional[Game] = None
         self.game_ended: bool = False
         self.players: List[Optional[Player]] = [None] * self.max_players
@@ -86,16 +86,30 @@ class GameRoom:
         return True
 
     def remove_player(self, sock: socket.socket) -> bool:
-        """Remove a player from the room and handle their cards if in game."""
+        """Remove a player from the room.
+
+        If a game is running and this player was the current player, their turn
+        is ended cleanly so the game can continue.  Cards are discarded and the
+        slot is cleared regardless.
+        """
         for i, player in enumerate(self.players):
             if player and player.sock == sock:
                 if self.game and self.game.players[i]:
-                    logger.info(f"Moving Player {i + 1}'s {len(self.game.players[i])} cards to discard in room '{self.room_name}'")
+                    logger.info(
+                        f"Moving Player {i + 1}'s {len(self.game.players[i])} "
+                        f"cards to discard in room '{self.room_name}'"
+                    )
+                    # Discard the disconnecting player's hand
                     self.game.discard_pile.extendleft(self.game.players[i])
                     self.game.players[i].clear()
                     self.disconnected.add(i)
+
+                    # If it was their turn, advance cleanly without drawing
                     if self.game.current_player == i:
-                        self.game.next_turn()
+                        # Force cards_played_this_turn > 0 so end_turn won't
+                        # make them draw — the hand is already empty.
+                        self.game.cards_played_this_turn = 1
+                        self.game.end_turn(i)
                 else:
                     self.player_names.pop(i, None)
 
@@ -115,12 +129,17 @@ class GameRoom:
                 and self.game is None and not self.game_ended)
 
     def start_game(self) -> bool:
-        """Initialize and start a new game if the room is ready."""
         if not self.can_start_game():
             return False
-        self.game = Game(self.max_players)
+        self.game = Game(self.max_players, self.rules)
         self.game.create_deck()
         self.game.deal_cards()
+        # Choose a random starting player among occupied slots so play
+        # does not always begin with the player who created/joined first.
+        occupied_slots = [i for i, p in enumerate(self.players) if p]
+        if occupied_slots:
+            self.game.current_player = random.choice(occupied_slots)
+            logger.info(f"Starting player for room '{self.room_name}' is Player {self.game.current_player + 1}")
         self.finish_order = []
         self.disconnected = set()
         player_count = len([p for p in self.players if p])
@@ -135,13 +154,12 @@ class GameRoom:
             "players": len([p for p in self.players if p]),
             "max_players": self.max_players,
             "in_game": self.game is not None or self.game_ended,
-            "created_at": self.created_at.strftime('%H:%M:%S')
+            "created_at": self.created_at.strftime('%H:%M:%S'),
+            "is_private": self.is_private
         }
 
 
 class LobbyManager:
-    """Manages clients in the lobby (not yet in a room)."""
-
     def __init__(self):
         self.clients: Set[socket.socket] = set()
         self.client_names: Dict[socket.socket, str] = {}
@@ -181,29 +199,31 @@ class LobbyManager:
 
 
 class RoomManager:
-    """Manages creation, joining, leaving, and lifecycle of game rooms."""
-
     def __init__(self):
         self.rooms: Dict[str, GameRoom] = {}
         self.client_rooms: Dict[socket.socket, str] = {}
 
     def create_room(self, sock: socket.socket, room_name: str, creator_name: str,
-                    max_players: int = MAX_PLAYERS_PER_ROOM) -> Optional[str]:
+                    max_players: int = MAX_PLAYERS_PER_ROOM, rules: dict = None,
+                    is_private: bool = False, password: str = None) -> Optional[str]:
         if len(self.rooms) >= MAX_ROOMS:
             return None
         if not (2 <= max_players <= MAX_PLAYERS_PER_ROOM):
             return None
         room_id = str(uuid.uuid4())
         creator = Player(sock, creator_name, 0)
-        room = GameRoom(room_id, room_name, creator, max_players)
+        room = GameRoom(room_id, room_name, creator, max_players, rules, is_private, password)
         self.rooms[room_id] = room
         self.client_rooms[sock] = room_id
         return room_id
 
-    def join_room(self, sock: socket.socket, room_id: str, player_name: str) -> Optional[int]:
+    def join_room(self, sock: socket.socket, room_id: str, player_name: str,
+                  password: str = None) -> Optional[int]:
         if room_id not in self.rooms:
             return None
         room = self.rooms[room_id]
+        if room.is_private and room.password != password:
+            return -1
         if room.is_full() or room.game or room.game_ended:
             return None
         slot = next((i for i, p in enumerate(room.players) if p is None), None)
@@ -218,7 +238,6 @@ class RoomManager:
 
     def leave_room(self, sock: socket.socket, server: 'MultiRoomServer',
                    lobby: LobbyManager) -> None:
-        """Handle a player leaving their current room."""
         if sock in self.client_rooms:
             room_id = self.client_rooms[sock]
             if room_id in self.rooms:
@@ -280,7 +299,6 @@ class RoomManager:
                 if not room.game and not room.game_ended]
 
     def end_game(self, room_id: str, server: 'MultiRoomServer', lobby: LobbyManager) -> None:
-        """End the game in a room and broadcast results."""
         if room_id not in self.rooms:
             return
         room = self.rooms[room_id]
@@ -322,8 +340,6 @@ class RoomManager:
 
 
 class MessageHandler:
-    """Processes incoming client messages for lobby and room contexts."""
-
     def __init__(self, lobby: LobbyManager, rooms: RoomManager, server: 'MultiRoomServer'):
         self.lobby = lobby
         self.rooms = rooms
@@ -370,7 +386,10 @@ class MessageHandler:
                 })
                 return
 
-            room_id = self.rooms.create_room(sock, room_name, creator_name, max_players)
+            rules = message.get("rules", {})
+            is_private = message.get("is_private", False)
+            password = message.get("password")
+            room_id = self.rooms.create_room(sock, room_name, creator_name, max_players, rules, is_private, password)
             if room_id:
                 self.server.lobby.remove_client(sock)
                 self.server.lobby.player_room_created[creator_name] = True
@@ -398,9 +417,13 @@ class MessageHandler:
                 return
 
             room_id = message.get("room_id")
-            slot = self.rooms.join_room(sock, room_id, self.server.client_names[sock])
+            password = message.get("password")
+            slot = self.rooms.join_room(sock, room_id, self.server.client_names[sock], password)
 
-            if slot is not None:
+            if slot == -1:
+                self.server.send_message(sock, {"t": "e", "msg": "Nesprávne heslo!"})
+                return
+            elif slot is not None:
                 self.server.lobby.remove_client(sock)
                 player_name = self.server.client_names[sock]
                 room = self.rooms.rooms[room_id]
@@ -459,7 +482,8 @@ class MessageHandler:
 
             if msg_type == "p" and player_slot == room.game.current_player:
                 card_index = message.get("ci", -1)
-                if room.game.play_card(player_slot, card_index):
+                chosen_suit = message.get("cs", None)
+                if room.game.play_card(player_slot, card_index, chosen_suit):
                     if not room.game.players[player_slot] and player_slot not in room.finish_order:
                         room.finish_order.append(player_slot)
                         logger.info(f"Player {player_slot + 1} finished in room '{room.room_name}'")
@@ -467,12 +491,11 @@ class MessageHandler:
                 else:
                     self.server.send_message(sock, {"t": "e", "msg": "Invalid card play"})
 
-            elif msg_type == "d" and player_slot == room.game.current_player:
-                if room.game.draw_card(player_slot):
-                    room.game.next_turn()
+            elif msg_type == "et" and player_slot == room.game.current_player:
+                if room.game.end_turn(player_slot):
                     self._broadcast_game_state(room_id)
                 else:
-                    self.server.send_message(sock, {"t": "e", "msg": "Cannot draw: draw pile empty"})
+                    self.server.send_message(sock, {"t": "e", "msg": "Cannot end turn right now"})
             else:
                 self.server.send_message(sock, {"t": "e", "msg": "Invalid action or not your turn"})
 
@@ -487,8 +510,6 @@ class MessageHandler:
 
 
 class MultiRoomServer:
-    """Main server class handling connections, messaging, and game loop."""
-
     def __init__(self, port: int):
         self.sel = selectors.DefaultSelector()
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -531,7 +552,6 @@ class MultiRoomServer:
         sys.exit(0)
 
     def send_message(self, sock: socket.socket, message: dict, retries: int = 2) -> bool:
-        """Send a compressed JSON message to a client socket."""
         try:
             data = zlib.compress(json.dumps(message, separators=(',', ':')).encode())
             sock.sendall(struct.pack('!I', len(data)) + data)
@@ -545,7 +565,6 @@ class MultiRoomServer:
             return False
 
     def receive_message(self, sock: socket.socket) -> Optional[dict]:
-        """Receive and decode a length-prefixed message from a client."""
         try:
             length_data = sock.recv(4)
             if not length_data:
@@ -563,7 +582,6 @@ class MultiRoomServer:
             return None
 
     def start(self) -> None:
-        """Main server event loop."""
         logger.info("Server ready for connections")
         while True:
             events = self.sel.select(timeout=0.1)
@@ -571,7 +589,6 @@ class MultiRoomServer:
                 callback = key.data
                 callback(key.fileobj, mask)
 
-            # Process game logic for active rooms
             for room_id in list(self.rooms.rooms.keys()):
                 room = self.rooms.rooms.get(room_id)
                 if not room:
@@ -581,7 +598,7 @@ class MultiRoomServer:
                     current_player = room.game.current_player
                     if len(room.game.players[current_player]) == 0 and not room.game.check_game_over():
                         logger.info(f"Auto-skipping turn for Player {current_player + 1} in room '{room.room_name}'")
-                        room.game.next_turn()
+                        room.game.end_turn(current_player)
                         self.message_handler._broadcast_game_state(room_id)
 
                     if room.game and room.game.check_game_over():
