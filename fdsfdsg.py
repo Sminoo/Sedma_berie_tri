@@ -58,10 +58,123 @@ class CardSprite(pygame.sprite.Sprite):
         self.angle = angle
 
 
+class CardAnimation:
+    """A single card flying from a start position to a target position."""
+
+    def __init__(self, image: pygame.Surface, start: Tuple[float, float],
+                 end: Tuple[float, float], duration_ms: int, angle: float = 0):
+        self.image = image
+        self.start = start
+        self.end = end
+        self.duration_ms = duration_ms
+        self.elapsed_ms: float = 0
+        self.angle = angle
+        self.done = False
+
+    def update(self, dt_ms: float) -> None:
+        self.elapsed_ms = min(self.elapsed_ms + dt_ms, self.duration_ms)
+        if self.elapsed_ms >= self.duration_ms:
+            self.done = True
+
+    @property
+    def current_pos(self) -> Tuple[float, float]:
+        t = self.elapsed_ms / self.duration_ms if self.duration_ms > 0 else 1.0
+        # Smooth ease-out
+        t = 1 - (1 - t) ** 3
+        x = self.start[0] + (self.end[0] - self.start[0]) * t
+        y = self.start[1] + (self.end[1] - self.start[1]) * t
+        return x, y
+
+    def draw(self, screen: pygame.Surface) -> None:
+        if self.done:
+            return
+        rotated = pygame.transform.rotate(self.image, self.angle)
+        screen.blit(rotated, (int(self.current_pos[0]), int(self.current_pos[1])))
+
+
+class AnimationManager:
+    """Manages card animations: dealing, playing, and drawing."""
+
+    DEAL_INTERVAL = 100
+    DEAL_DURATION = 250
+    PLAY_DURATION = 200
+
+    def __init__(self):
+        self._active: List[CardAnimation] = []
+        self._pending: List[Tuple] = []
+        self._queue_timer: float = 0.0
+        # (player_index, card_index) pairs that are hidden until their animation lands
+        self.hidden_cards: set = set()
+        self.on_deal_complete = None
+        # Called with (player_index, card_index) each time a deal animation lands
+        self.on_card_land = None
+
+    @property
+    def is_dealing(self) -> bool:
+        return bool(self._active or self._pending)
+
+    def queue_deal(self, image: pygame.Surface, start: Tuple[float, float],
+                   end: Tuple[float, float], angle: float,
+                   player_index: int, card_index: int,
+                   pre_hidden: bool = False) -> None:
+        """Queue a deal animation. If pre_hidden=True the caller already added to hidden_cards."""
+        if not pre_hidden:
+            self.hidden_cards.add((player_index, card_index))
+        self._pending.append((image, start, end, angle, player_index, card_index))
+
+    def play_card(self, image: pygame.Surface, start: Tuple[float, float],
+                  end: Tuple[float, float], angle: float = 0) -> None:
+        self._active.append(CardAnimation(image, start, end, self.PLAY_DURATION, angle))
+
+    def update(self, dt_ms: float) -> None:
+        if self._pending:
+            self._queue_timer -= dt_ms
+            if self._queue_timer <= 0:
+                img, s, e, ang, pi, ci = self._pending.pop(0)
+                anim = CardAnimation(img, s, e, self.DEAL_DURATION, ang)
+                anim.player_index = pi
+                anim.card_index = ci
+                self._active.append(anim)
+                self._queue_timer = self.DEAL_INTERVAL
+
+        for anim in self._active:
+            anim.update(dt_ms)
+
+        for a in self._active:
+            if a.done:
+                pi = getattr(a, "player_index", None)
+                ci = getattr(a, "card_index", None)
+                if pi is not None and ci is not None:
+                    self.hidden_cards.discard((pi, ci))
+                    if self.on_card_land:
+                        self.on_card_land(pi, ci)
+
+        self._active = [a for a in self._active if not a.done]
+
+        if self.on_deal_complete and not self._active and not self._pending:
+            cb = self.on_deal_complete
+            self.on_deal_complete = None
+            cb()
+
+    def draw(self, screen: pygame.Surface) -> None:
+        for anim in self._active:
+            anim.draw(screen)
+
+    def clear(self) -> None:
+        self._active.clear()
+        self._pending.clear()
+        self._queue_timer = 0.0
+        self.hidden_cards.clear()
+        self.on_deal_complete = None
+        # Note: on_card_land is NOT cleared — it is wired up once in EventHandler
+
+
 class LayoutManager:
     """Manages card and UI element positions for different player seat arrangements."""
 
     def __init__(self, screen_width: int, screen_height: int):
+        self.screen_width = screen_width
+        self.screen_height = screen_height
         self.positions = [
             {"x": screen_width // 2, "y": screen_height - 172, "angle": 0, "offset": 84},
             {"x": screen_width - 172, "y": screen_height // 2, "angle": -90, "offset": 84},
@@ -76,7 +189,7 @@ class LayoutManager:
         self.name_positions = [
             {"x": screen_width // 2, "y": screen_height - 190, "align": "center", "angle": 0},
             {"x": screen_width - 190, "y": screen_height // 2, "align": "center", "angle": 90},
-            {"x": screen_width // 2, "y": 190, "align": "center", "angle": 180},
+            {"x": screen_width // 2, "y": 190, "align": "center", "angle": 0},
             {"x": 190, "y": screen_height // 2, "align": "center", "angle": -90}
         ]
 
@@ -89,7 +202,7 @@ class LayoutManager:
         if is_local:
             offset = base_offset if num_cards <= 8 else max(35, base_offset - (num_cards - 8) * 3)
         else:
-            offset = max(30, base_offset - max(0, (num_cards - 3) * 4))
+            offset = max(14, base_offset - max(0, (num_cards - 2) * 8))
 
         if pos_index in (0, 2):
             x = pos["x"] - (num_cards * offset // 2) + (card_index * offset)
@@ -281,6 +394,7 @@ class StateManager:
         self.leaderboard_start: float = 0
         self.leaderboard_data: Optional[List[Dict]] = None
         self.target_private_room_id: Optional[str] = None
+        self.dealing_animation: bool = False
 
 
 class LanServerManager:
@@ -774,9 +888,12 @@ class Renderer:
                 if card_sprites.get(i):
                     card_sprites[i].draw(self.screen)
                     if i == state_manager.local_player and current_player == state_manager.local_player:
+                        hovered = None
                         for sprite in card_sprites[i]:
                             if sprite.rect.collidepoint(mouse_pos):
-                                pygame.draw.rect(self.screen, HIGHLIGHT_COLOR, sprite.rect, CARD_HIGHLIGHT_THICKNESS)
+                                hovered = sprite  # last match = topmost visible card
+                        if hovered:
+                            pygame.draw.rect(self.screen, HIGHLIGHT_COLOR, hovered.rect, CARD_HIGHLIGHT_THICKNESS)
 
             draw_pile_rect = self.layout.draw_pile_rect
             if draw_pile_rect.collidepoint(mouse_pos):
@@ -785,7 +902,7 @@ class Renderer:
             if state_manager.game_state.get("draw_pile_count", 0) > 0:
                 self.screen.blit(self.card_back, (draw_pile_rect.x + 3, draw_pile_rect.y + 3))
 
-            if state_manager.game_state.get("discard_pile"):
+            if state_manager.game_state.get("discard_pile") and not getattr(state_manager, 'dealing_animation', False):
                 top = state_manager.game_state["discard_pile"][-1]
                 card = Card(top["name"], top["value"], top["suit"])
                 card.draw(self.screen, *self.layout.discard_pile_pos)
@@ -903,6 +1020,12 @@ class EventHandler:
         self.room_is_private: bool = False
         self.pending_join_room_id = None
         self.current_room_password = None
+        self.animation_manager: AnimationManager = AnimationManager()
+        self._prev_hand_sizes: Dict[int, int] = {}
+        # Stores (card, rect_x, rect_y, angle) of card waiting for server confirmation
+        self._pending_play: Optional[Tuple] = None
+        # Re-render sprites each time a deal animation lands (reveals the card)
+        self.animation_manager.on_card_land = lambda pi, ci: self.update_card_sprites()
 
     @staticmethod
     def validate_ip(ip: str) -> bool:
@@ -1192,13 +1315,19 @@ class EventHandler:
     def _handle_game_click(self, pos: Tuple[int, int]) -> None:
         if getattr(self.state_manager, 'suit_picker_active', False):
             suits = ["srdce", "zelen", "zalud", "gula"]
+            picker_rect = pygame.Rect(SCREEN_WIDTH // 2 - 150, SCREEN_HEIGHT // 2 - 60, 300, 120)
             for i, suit in enumerate(suits):
                 btn_rect = pygame.Rect(SCREEN_WIDTH // 2 - 120 + i * 60, SCREEN_HEIGHT // 2, 50, 40)
                 if btn_rect.collidepoint(pos):
                     self.network.send_message(
                         {"t": "p", "ci": getattr(self.state_manager, 'suit_picker_card_index', -1), "cs": suit})
                     self.state_manager.suit_picker_active = False
+                    # _pending_play stays — gs handler fires the animation on confirmation
                     return
+            # Click outside picker — cancel the hornik play
+            if not picker_rect.collidepoint(pos):
+                self.state_manager.suit_picker_active = False
+                self._pending_play = None
             return
 
         if self.ui_elements["leave_room"].rect.collidepoint(pos):
@@ -1210,12 +1339,25 @@ class EventHandler:
                 self.network.send_message({"t": "et"})
                 return
 
-            for i, sprite in enumerate(self.card_sprites[self.state_manager.local_player].sprites()):
+            sprites = list(self.card_sprites[self.state_manager.local_player].sprites())
+            for i, sprite in reversed(list(enumerate(sprites))):
                 if sprite.rect.collidepoint(pos):
                     if sprite.card.value == 12 and self.rules.get("hornik_changes_suit", True):
                         self.state_manager.suit_picker_active = True
                         self.state_manager.suit_picker_card_index = i
+                        # Store pending now; animation fires after server confirms
+                        self._pending_play = (
+                            sprite.card,
+                            float(sprite.rect.x), float(sprite.rect.y),
+                            sprite.angle
+                        )
                     else:
+                        # Store the card info; play animation only after server confirms
+                        self._pending_play = (
+                            sprite.card,
+                            float(sprite.rect.x), float(sprite.rect.y),
+                            sprite.angle
+                        )
                         self.network.send_message({"t": "p", "ci": i})
                     return
 
@@ -1393,10 +1535,49 @@ class EventHandler:
                 message["player_names"] = {int(k): v for k, v in message["player_names"].items()}
                 self.state_manager.player_names = message["player_names"]
             self.state_manager.num_players = message.get("num_players", len(message.get("players", [])))
+            prev_state = self.state_manager.state
+            # Snapshot old hand sizes BEFORE updating state
+            old_hand_sizes: Dict[int, int] = {}
+            if self.state_manager.game_state:
+                for pi, ph in enumerate(self.state_manager.game_state.get("players", [])):
+                    old_hand_sizes[pi] = len(ph)
             self.state_manager.game_state = message
             self.state_manager.waiting_message = None
             self.state_manager.state = "playing"
-            self.update_card_sprites()
+            if prev_state != "playing":
+                # ── Game start: pre-hide ALL cards, then queue round-robin deal ──
+                self.state_manager.dealing_animation = True
+                self._trigger_deal_animation()   # fills hidden_cards first, then queues
+                self.update_card_sprites()        # renders nothing (all hidden)
+                def _on_deal_done():
+                    self.state_manager.dealing_animation = False
+                self.animation_manager.on_deal_complete = _on_deal_done
+            else:
+                # ── Mid-game: fire confirmed play animation if pending ────────
+                local = self.state_manager.local_player
+                if self._pending_play and local is not None:
+                    new_local_size = len(message.get("players", [[]]*(local+1))[local]) if local < len(message.get("players", [])) else 0
+                    old_local_size = old_hand_sizes.get(local, new_local_size)
+                    if new_local_size < old_local_size:
+                        # Server confirmed the card was played — animate now
+                        card, sx, sy, angle = self._pending_play
+                        self._trigger_play_animation(card, sx, sy, angle)
+                    self._pending_play = None
+
+                # ── Detect newly drawn cards ─────────────────────────────────
+                new_players = message.get("players", [])
+                drew_cards: List[Tuple[int, dict, int, int]] = []
+                for pi, hand in enumerate(new_players):
+                    old_size = old_hand_sizes.get(pi, len(hand))
+                    new_size = len(hand)
+                    if new_size > old_size:
+                        for ci in range(old_size, new_size):
+                            # Pre-hide BEFORE update_card_sprites so it never flashes
+                            self.animation_manager.hidden_cards.add((pi, ci))
+                            drew_cards.append((pi, hand[ci], ci, new_size))
+                self.update_card_sprites()        # renders without the newly hidden cards
+                for pi, card_data, card_index, final_hand_size in drew_cards:
+                    self._trigger_draw_animation(pi, card_data, card_index, final_hand_size)
 
         elif msg_type == "go":
             if "player_names" in message:
@@ -1408,6 +1589,7 @@ class EventHandler:
             self.card_sprites = {i: pygame.sprite.Group() for i in range(4)}
             self.current_room_id = None
             self.current_room_name = ""
+            self.animation_manager.clear()
 
         elif msg_type == "back_to_lobby":
             self.state_manager.state = "lobby"
@@ -1418,7 +1600,79 @@ class EventHandler:
             self.state_manager.current_room_password = None
 
         elif msg_type == "e":
+            self._pending_play = None
             self.state_manager.waiting_message = f"Error: {message.get('msg', 'Unknown error')}"
+
+    def _trigger_deal_animation(self) -> None:
+        """Queue deal animations in round-robin: 1 card per player per round."""
+        if not self.state_manager.game_state or self.state_manager.local_player is None:
+            return
+        am = self.animation_manager
+        am.clear()
+        draw_pile_pos = (float(self.layout.draw_pile_rect.x + 3), float(self.layout.draw_pile_rect.y + 3))
+        back_surface = None
+        if self.renderer.card_back:
+            try:
+                back_surface = pygame.transform.scale(self.renderer.card_back, (CARD_WIDTH, CARD_HEIGHT))
+            except Exception:
+                pass
+        num_players = self.state_manager.num_players
+        players_data = self.state_manager.game_state.get("players", [])
+        hand_size = max((len(players_data[i]) for i in range(num_players) if i < len(players_data)), default=0)
+        # Round-robin: card round 0..hand_size-1, inner loop player 0..num_players-1
+        for card_round in range(hand_size):
+            for i in range(num_players):
+                hand = players_data[i] if i < len(players_data) else []
+                if card_round >= len(hand):
+                    continue
+                card_data = hand[card_round]
+                pos_index = (i - self.state_manager.local_player) % num_players
+                is_local = (i == self.state_manager.local_player)
+                x, y, angle = self.layout.get_player_position(pos_index, len(hand), card_round, is_local=is_local)
+                if is_local:
+                    card_key = card_data["name"]
+                    if card_key not in self.card_cache:
+                        self.card_cache[card_key] = Card(card_data["name"], card_data["value"], card_data["suit"])
+                    img = self.card_cache[card_key].image
+                else:
+                    img = back_surface or pygame.Surface((CARD_WIDTH, CARD_HEIGHT))
+                rotated_img = pygame.transform.rotate(img, angle)
+                am.queue_deal(rotated_img, draw_pile_pos, (float(x), float(y)), angle=0,
+                              player_index=i, card_index=card_round)
+
+    def _trigger_draw_animation(self, player_index: int, card_data: dict,
+                                   card_index: int, final_hand_size: int) -> None:
+        """Animate a drawn card flying to its correct slot in the hand."""
+        if self.state_manager.local_player is None:
+            return
+        am = self.animation_manager
+        pos_index = (player_index - self.state_manager.local_player) % self.state_manager.num_players
+        is_local = (player_index == self.state_manager.local_player)
+        # final_hand_size drives spacing so all cards land at correct positions
+        x, y, angle = self.layout.get_player_position(pos_index, final_hand_size, card_index, is_local=is_local)
+        draw_pile_pos = (float(self.layout.draw_pile_rect.x + 3), float(self.layout.draw_pile_rect.y + 3))
+        if is_local:
+            card_key = card_data["name"]
+            if card_key not in self.card_cache:
+                self.card_cache[card_key] = Card(card_data["name"], card_data["value"], card_data["suit"])
+            img = self.card_cache[card_key].image
+        else:
+            if self.renderer.card_back:
+                try:
+                    img = pygame.transform.scale(self.renderer.card_back, (CARD_WIDTH, CARD_HEIGHT))
+                except Exception:
+                    img = pygame.Surface((CARD_WIDTH, CARD_HEIGHT))
+            else:
+                img = pygame.Surface((CARD_WIDTH, CARD_HEIGHT))
+        rotated_img = pygame.transform.rotate(img, angle)
+        am.queue_deal(rotated_img, draw_pile_pos, (float(x), float(y)), angle=0,
+                      player_index=player_index, card_index=card_index, pre_hidden=True)
+
+    def _trigger_play_animation(self, card: Card, start_x: float, start_y: float, angle: float) -> None:
+        """Start an animation of card flying from hand to discard pile."""
+        dx, dy = self.layout.discard_pile_pos
+        img = pygame.transform.rotate(card.image, angle)
+        self.animation_manager.play_card(img, (start_x, start_y), (dx, dy), angle=0)
 
     def update_card_sprites(self) -> None:
         if not self.state_manager.game_state or self.state_manager.local_player is None:
@@ -1439,6 +1693,8 @@ class EventHandler:
             except Exception:
                 back_card = None
 
+        hidden = self.animation_manager.hidden_cards
+
         for i in range(num_players):
             hand = self.state_manager.game_state.get("players", [])[i]
             if not hand:
@@ -1448,6 +1704,10 @@ class EventHandler:
             is_local = (i == self.state_manager.local_player)
 
             for j, card_data in enumerate(hand):
+                # Skip cards that are still mid-animation (will appear when they land)
+                if (i, j) in hidden:
+                    continue
+
                 card_key = card_data["name"]
                 if card_key not in self.card_cache:
                     self.card_cache[card_key] = Card(card_data["name"], card_data["value"], card_data["suit"])
@@ -1521,7 +1781,7 @@ class MultiRoomClient:
             "refresh": UIElement(pygame.Rect(50, 200, 200, 40), "Refresh Rooms", self.font, BUTTON_COLOR),
             "disconnect": UIElement(pygame.Rect(50, SCREEN_HEIGHT - 60, 200, 40), "Disconnect", self.font,
                                     BUTTON_COLOR),
-            "leave_room": UIElement(pygame.Rect(50, SCREEN_HEIGHT - 60, 150, 40), "Leave Room", self.font,
+            "leave_room": UIElement(pygame.Rect(10, SCREEN_HEIGHT - 44, 90, 30), "Leave", self.font,
                                     BUTTON_COLOR),
             "customize": UIElement(
                 pygame.Rect(20, SCREEN_HEIGHT - 80, 180, 60),
@@ -1552,6 +1812,8 @@ class MultiRoomClient:
         clock = pygame.time.Clock()
 
         while self.running:
+            dt = clock.tick(60)
+
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     self.running = False
@@ -1572,10 +1834,16 @@ class MultiRoomClient:
                 self.state_manager.leaderboard_data = None
                 self.state_manager.game_state = None
 
+            # Update animations
+            self.event_handler.animation_manager.update(dt)
+
             mouse_pos = pygame.mouse.get_pos()
             self._render(mouse_pos)
+
+            # Draw card animations on top of everything
+            self.event_handler.animation_manager.draw(self.screen)
+
             pygame.display.flip()
-            clock.tick(60)
 
         self._cleanup()
 

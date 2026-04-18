@@ -1,3 +1,5 @@
+from asyncio import wait
+
 import pygame
 import socket
 import json
@@ -26,7 +28,7 @@ PORT = 65432
 CARD_WIDTH, CARD_HEIGHT = 80, 142
 CARD_HIGHLIGHT_THICKNESS = 3
 CLICK_DEBOUNCE_MS = 200
-LEADERBOARD_DURATION = 10
+LEADERBOARD_DURATION = 5
 
 # Colors
 BACKGROUND_COLOR = (0, 0, 0)
@@ -60,8 +62,6 @@ class LayoutManager:
     """Manages card and UI element positions for different player seat arrangements."""
 
     def __init__(self, screen_width: int, screen_height: int):
-        self.screen_w = screen_width
-        self.screen_h = screen_height
         self.positions = [
             {"x": screen_width // 2, "y": screen_height - 172, "angle": 0, "offset": 84},
             {"x": screen_width - 172, "y": screen_height // 2, "angle": -90, "offset": 84},
@@ -82,44 +82,21 @@ class LayoutManager:
 
     def get_player_position(self, pos_index: int, num_cards: int, card_index: int,
                             is_local: bool = False) -> Tuple[int, int, float]:
-        """Calculate card position based on seat, hand size, and card index.
-
-        Cards are spread so the full fan always fits within the screen.
-        For the local player (bottom) the usable width is the screen minus
-        side margins; for side players (left/right) the usable height is
-        the screen minus top/bottom margins.
-        """
+        """Calculate card position based on seat, hand size, and card index."""
         pos = self.positions[pos_index]
+        base_offset = 84
+
+        if is_local:
+            offset = base_offset if num_cards <= 8 else max(35, base_offset - (num_cards - 8) * 3)
+        else:
+            offset = max(30, base_offset - max(0, (num_cards - 3) * 4))
 
         if pos_index in (0, 2):
-            # Horizontal fan (bottom / top)
-            margin = 20  # pixels kept free on each side
-            usable = self.screen_w - 2 * margin - CARD_WIDTH
-            if num_cards <= 1:
-                offset = 0
-            else:
-                max_offset = usable // max(num_cards - 1, 1)
-                if is_local:
-                    # Local player: prefer comfortable 84 px, shrink if needed
-                    offset = min(84, max_offset)
-                else:
-                    # Opponent at top: smaller cards are fine, cap at 52 px
-                    offset = min(52, max_offset)
-            total_w = (num_cards - 1) * offset if num_cards > 1 else 0
-            x = self.screen_w // 2 - total_w // 2 + card_index * offset
+            x = pos["x"] - (num_cards * offset // 2) + (card_index * offset)
             y = pos["y"]
         else:
-            # Vertical fan (left / right side)
-            margin = 20
-            usable = self.screen_h - 2 * margin - CARD_WIDTH  # rotated card width ≈ CARD_HEIGHT but use CARD_WIDTH as step
-            if num_cards <= 1:
-                offset = 0
-            else:
-                max_offset = usable // max(num_cards - 1, 1)
-                offset = min(52, max_offset)
-            total_h = (num_cards - 1) * offset if num_cards > 1 else 0
             x = pos["x"]
-            y = self.screen_h // 2 - total_h // 2 + card_index * offset
+            y = pos["y"] - (num_cards * offset // 2) + (card_index * offset)
 
         return x, y, pos["angle"]
 
@@ -178,12 +155,7 @@ class NetworkManager:
             return False
 
     def receive_message(self, retries: int = 3, delay: float = 0.1) -> Optional[dict]:
-        """Receive and decompress a length-prefixed JSON message.
-
-        Returns a dict. If the server closed the connection it returns a
-        message with t=="server_disconnected" so the rest of the client can
-        handle it explicitly.
-        """
+        """Receive and decompress a length-prefixed JSON message."""
         sock = self.client_socket
         if sock is None:
             return None
@@ -193,7 +165,6 @@ class NetworkManager:
             try:
                 if len(buffer) < 4:
                     packet = sock.recv(4)
-                    # empty packet indicates orderly shutdown by peer
                     if packet == b"":
                         return {"t": "server_disconnected"}
                     if not packet:
@@ -215,7 +186,6 @@ class NetworkManager:
                     time.sleep(delay)
                     continue
                 logger.error(f"Receive error: {e}")
-                # treat unrecoverable socket errors as disconnection
                 return {"t": "server_disconnected"}
             except (json.JSONDecodeError, struct.error, zlib.error) as e:
                 logger.error(f"Decode error: {e}")
@@ -324,7 +294,6 @@ class LanServerManager:
         atexit.register(self.stop)
 
     def get_local_ip(self) -> str:
-        """Detect the local network IP address."""
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.connect(("8.8.8.8", 80))
@@ -335,7 +304,6 @@ class LanServerManager:
             return "127.0.0.1"
 
     def start(self) -> bool:
-        """Start server.py as a background subprocess."""
         if self.running:
             return False
         try:
@@ -357,7 +325,6 @@ class LanServerManager:
             return False
 
     def stop(self) -> None:
-        """Terminate the server subprocess."""
         if self.process:
             try:
                 self.process.terminate()
@@ -385,13 +352,11 @@ class Renderer:
         self.background: Optional[pygame.Surface] = None
         self.card_back: Optional[pygame.Surface] = None
 
-        # Customization options
         self.background_options = [
             "background_green.png",
             "background_blue.png",
             "background_red.png",
         ]
-        # Card backs are individual images inside assets/cards/card_backs
         backs_dir = os.path.join("assets", "cards", "card_backs")
         try:
             backs = [f for f in os.listdir(backs_dir) if f.lower().endswith((".png", ".jpg", ".bmp"))]
@@ -401,12 +366,10 @@ class Renderer:
             self.card_back_themes = ["back.png"]
 
         self.selected_background = self.background_options[0]
-        # selected_card_theme stores the filename of the chosen back image
         self.selected_card_theme = self.card_back_themes[0]
         self.current_background_path = f"assets/backgrounds/{self.selected_background}"
         self.current_card_back_path = os.path.join("assets", "cards", "card_backs", self.selected_card_theme)
 
-        # Load suit images for horník picker/indicator
         self.suit_images = {}
         suits = ["srdce", "zelen", "zalud", "gula"]
         for s in suits:
@@ -415,18 +378,15 @@ class Renderer:
                 img = pygame.image.load(path).convert_alpha()
                 self.suit_images[s] = img
             except Exception:
-                # fallback colored surface
                 fallback = pygame.Surface((48, 48), pygame.SRCALPHA)
                 colors = {"srdce": (200, 50, 50), "zelen": (50, 200, 50), "zalud": (150, 100, 50),
                           "gula": (200, 200, 50)}
                 fallback.fill(colors.get(s, (120, 120, 120)))
                 self.suit_images[s] = fallback
 
-        # For lobby player-count display
         self.selected_room_max_players = 4
 
     def load_assets(self, background_path: str, card_back_path: str, size: Tuple[int, int]) -> None:
-        """Load background and card back images, with fallbacks."""
         try:
             self.background = pygame.image.load(background_path)
             if self.background.get_size() != (SCREEN_WIDTH, SCREEN_HEIGHT):
@@ -444,7 +404,6 @@ class Renderer:
             self.card_back.fill((180, 30, 30))
 
     def _draw_background(self) -> None:
-        """Fill screen and draw background image."""
         self.screen.fill(BACKGROUND_COLOR)
         if self.background:
             self.screen.blit(self.background, (0, 0))
@@ -452,31 +411,26 @@ class Renderer:
     def render_menu(self, ip_field: InputField, name_field: InputField, connect_btn: UIElement,
                     close_btn: UIElement, lan_btn: UIElement, lan_server: LanServerManager,
                     waiting_message: Optional[str], public_btn: UIElement = None) -> None:
-        """Draw the main menu screen with connection fields and LAN server button."""
         self._draw_background()
 
-        # Title
         title = self.title_font.render("Sedma Bere Tri", True, TEXT_COLOR)
         self.screen.blit(title, title.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 - 250)))
 
-        # Input fields with labels
         ip_label = self.font.render("Server IP:", True, TEXT_COLOR)
-        self.screen.blit(ip_label, (ip_field.rect.x, ip_field.rect.y - 26))
+        self.screen.blit(ip_label, (ip_field.rect.x, ip_field.rect.y - 30))
         ip_field.draw(self.screen)
 
         name_label = self.font.render("Your Name:", True, TEXT_COLOR)
-        self.screen.blit(name_label, (name_field.rect.x, name_field.rect.y - 26))
+        self.screen.blit(name_label, (name_field.rect.x, name_field.rect.y - 30))
         name_field.draw(self.screen)
 
         mouse_pos = pygame.mouse.get_pos()
         connect_btn.draw(self.screen, mouse_pos)
         close_btn.draw(self.screen, mouse_pos)
 
-        # Public server button
         if public_btn:
             public_btn.draw(self.screen, mouse_pos)
 
-        # LAN Server section (bottom-right)
         if lan_server.running and lan_server.local_ip:
             ip_text = self.font.render(f"LAN IP: {lan_server.local_ip}:{PORT}", True, SUCCESS_COLOR)
             ip_rect = ip_text.get_rect(right=SCREEN_WIDTH - 20, bottom=lan_btn.rect.top - 5)
@@ -488,7 +442,6 @@ class Renderer:
 
         lan_btn.draw(self.screen, mouse_pos)
 
-        # Status message
         if waiting_message:
             is_error = "error" in waiting_message.lower() or "please" in waiting_message.lower()
             msg_color = ERROR_COLOR if is_error else TEXT_COLOR
@@ -496,13 +449,11 @@ class Renderer:
             self.screen.blit(msg_surface, msg_surface.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 185)))
 
     def render_customize(self, mouse_pos: Tuple[int, int]) -> None:
-        """Draw the customization screen for backgrounds and card backs."""
         self._draw_background()
 
         title = self.title_font.render("Customize", True, TEXT_COLOR)
         self.screen.blit(title, title.get_rect(center=(SCREEN_WIDTH // 2, 80)))
 
-        # Background section
         bg_title = self.font.render("Background", True, TEXT_COLOR)
         self.screen.blit(bg_title, (120, 160))
 
@@ -516,7 +467,6 @@ class Renderer:
             self.screen.blit(label, (130, y + 10))
             y += 55
 
-        # Deck Design section
         card_title = self.font.render("Deck Design", True, TEXT_COLOR)
         self.screen.blit(card_title, (SCREEN_WIDTH // 2 + 50, 160))
 
@@ -531,7 +481,6 @@ class Renderer:
             self.screen.blit(label, (SCREEN_WIDTH // 2 + 60, y + 10))
             y += 55
 
-        # Preview of selected card back (moved beside selection)
         preview_x = SCREEN_WIDTH // 2 + 400
         preview_y = 210
         preview_title = self.font.render("Back Preview", True, TEXT_COLOR)
@@ -545,7 +494,6 @@ class Renderer:
             placeholder_rect = pygame.Rect(preview_x, preview_y, preview_size[0], preview_size[1])
             pygame.draw.rect(self.screen, PLACEHOLDER_COLOR, placeholder_rect)
 
-        # Buttons
         apply_rect = pygame.Rect(SCREEN_WIDTH // 2 - 220, SCREEN_HEIGHT - 100, 200, 60)
         cancel_rect = pygame.Rect(SCREEN_WIDTH // 2 + 40, SCREEN_HEIGHT - 100, 200, 60)
 
@@ -555,10 +503,9 @@ class Renderer:
             txt = self.font.render(text, True, TEXT_COLOR)
             self.screen.blit(txt, txt.get_rect(center=rect.center))
 
-    def render_lobby(self, background_path: str, player_name: str,
+    def render_lobby(self, background_path: str, player_name: str, room_name_field: InputField,
                      create_btn: UIElement, refresh_btn: UIElement, disconnect_btn: UIElement,
-                     rooms_list: List[Dict], waiting_message: Optional[str]) -> None:
-        """Draw the lobby screen with room creation and room list."""
+                     rooms_list: List[Dict], waiting_message: Optional[str], rules_state: Dict[str, bool]) -> None:
         try:
             self.background = pygame.image.load(background_path)
         except pygame.error:
@@ -572,7 +519,6 @@ class Renderer:
         create_btn.draw(self.screen, mouse_pos)
         refresh_btn.draw(self.screen, mouse_pos)
 
-        # Room list and disconnect
         self._render_room_list(rooms_list)
         disconnect_btn.draw(self.screen, mouse_pos)
 
@@ -589,14 +535,11 @@ class Renderer:
     def render_create_room(self, input_fields: Dict[str, 'InputField'], ui_elements: Dict[str, UIElement],
                            selected_max_players: int, rules: Dict[str, bool], room_is_private: bool,
                            mouse_pos: Tuple[int, int], waiting_message: Optional[str]) -> None:
-        """Draw the create-room dialog overlay."""
         self._draw_background()
-        # Dim background
         overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
         overlay.fill((0, 0, 0, 170))
         self.screen.blit(overlay, (0, 0))
 
-        # Dialog box – tall enough for all elements
         dlg_w, dlg_h = 620, 610
         dlg_x = SCREEN_WIDTH // 2 - dlg_w // 2
         dlg_y = SCREEN_HEIGHT // 2 - dlg_h // 2
@@ -607,10 +550,8 @@ class Renderer:
         title = self.title_font.render("Create Room", True, TEXT_COLOR)
         self.screen.blit(title, title.get_rect(center=(dlg_x + dlg_w // 2, dlg_y + 28)))
 
-        # Horizontal divider
         pygame.draw.line(self.screen, (70, 70, 70), (dlg_x + 20, dlg_y + 50), (dlg_x + dlg_w - 20, dlg_y + 50))
 
-        # --- Room name field ---
         room_name_label = self.font.render("Názov miestnosti:", True, TEXT_COLOR)
         self.screen.blit(room_name_label, (dlg_x + 30, dlg_y + 65))
         rn_field = input_fields.get("room_name")
@@ -618,7 +559,6 @@ class Renderer:
         rn_field.rect = pygame.Rect(dlg_x + 30, dlg_y + 92, dlg_w - 60, 36)
         rn_field.draw(self.screen)
 
-        # --- Player count ---
         pc_label = self.font.render("Počet hráčov:", True, TEXT_COLOR)
         self.screen.blit(pc_label, (dlg_x + 30, dlg_y + 148))
         for i, val in enumerate([2, 3, 4]):
@@ -630,7 +570,6 @@ class Renderer:
             label = self.small_font.render(str(val), True, TEXT_COLOR)
             self.screen.blit(label, label.get_rect(center=rect.center))
 
-        # --- Rules ---
         pygame.draw.line(self.screen, (70, 70, 70), (dlg_x + 20, dlg_y + 192), (dlg_x + dlg_w - 20, dlg_y + 192))
         rules_title = self.font.render("Pravidlá / Úpravy:", True, TEXT_COLOR)
         self.screen.blit(rules_title, (dlg_x + 30, dlg_y + 200))
@@ -650,16 +589,13 @@ class Renderer:
             self.screen.blit(label, (dlg_x + 54, y))
             y += 30
 
-        # --- Privacy + password ---
         pygame.draw.line(self.screen, (70, 70, 70), (dlg_x + 20, dlg_y + 392), (dlg_x + dlg_w - 20, dlg_y + 392))
 
-        # Privacy row: checkbox on the LEFT, label to its right – nothing overlaps
         privacy_chk = pygame.Rect(dlg_x + 30, dlg_y + 404, 18, 18)
         pygame.draw.rect(self.screen, (0, 180, 0) if room_is_private else (120, 120, 120), privacy_chk, border_radius=4)
         privacy_label = self.font.render("Súkromná miestnosť (vyžaduje heslo)", True, TEXT_COLOR)
         self.screen.blit(privacy_label, (dlg_x + 56, dlg_y + 403))
 
-        # Password field 36 px below the checkbox row
         pw_field = input_fields.get("room_password")
         old_pw_pos = pw_field.rect.topleft
         pw_row_y = dlg_y + 436
@@ -672,7 +608,6 @@ class Renderer:
             disabled = self.small_font.render("(zaškrtnite políčko pre zadanie hesla)", True, PLACEHOLDER_COLOR)
             self.screen.blit(disabled, (dlg_x + 30, pw_row_y + 8))
 
-        # --- Buttons ---
         btn_y = dlg_y + dlg_h - 58
         start_btn = ui_elements.get("start_room")
         cancel_btn = ui_elements.get("cancel_create")
@@ -681,13 +616,11 @@ class Renderer:
         start_btn.draw(self.screen, mouse_pos)
         cancel_btn.draw(self.screen, mouse_pos)
 
-        # Waiting / error message
         if waiting_message:
             msg_color = ERROR_COLOR if "error" in waiting_message.lower() else SUCCESS_COLOR
             msg = self.small_font.render(waiting_message, True, msg_color)
             self.screen.blit(msg, (dlg_x + 30, btn_y + 8))
 
-        # restore field positions so lobby layout is unchanged
         try:
             rn_field.rect.topleft = old_rn_pos
             pw_field.rect.topleft = old_pw_pos
@@ -695,7 +628,6 @@ class Renderer:
             pass
 
     def _render_room_list(self, rooms_list: List[Dict]) -> None:
-        """Draw the scrollable room list in the lobby."""
         list_title = self.font.render("Available Rooms (click to join):", True, TEXT_COLOR)
         self.screen.blit(list_title, (300, 120))
 
@@ -724,28 +656,84 @@ class Renderer:
                 color = (60, 60, 60)
             pygame.draw.rect(self.screen, color, room_rect)
 
-            # Room name (append lock icon if private)
             room_name = room.get("room_name", "Unknown")
             if room.get("is_private"):
                 room_name = "🔒 " + room_name
             title_text = self.font.render(room_name, True, TEXT_COLOR)
             self.screen.blit(title_text, (room_rect.x + 10, room_rect.y + 8))
 
-            # Creator
             creator_surface = self.small_font.render(f"by {room.get('creator', 'Unknown')}", True, details_color)
             self.screen.blit(creator_surface, (room_rect.x + 10, room_rect.y + 32))
 
-            # Player count
             players_text = f"{room.get('players', 0)}/{room.get('max_players', 4)} players"
             if room.get("in_game", False):
                 players_text += " (IN GAME)"
             players_surface = self.small_font.render(players_text, True, details_color)
             self.screen.blit(players_surface, (room_rect.x + 10, room_rect.y + 50))
 
+    def render_join_password(self, input_fields: Dict[str, 'InputField'],
+                             ui_elements: Dict[str, UIElement],
+                             mouse_pos: Tuple[int, int]) -> None:
+        """
+        Draw the join-password modal with a noticeably dark overlay and
+        well-spaced buttons so they do not overlap.
+
+        Layout (modal 440 x 240):
+          - Title at top
+          - Password field below title
+          - [Join] and [Cancel] on separate rows with 14 px gap
+        """
+        # --- Darker overlay (alpha 210 instead of 160) ---
+        overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 210))
+        self.screen.blit(overlay, (0, 0))
+
+        # --- Dialog box ---
+        w, h = 440, 240
+        x = SCREEN_WIDTH // 2 - w // 2
+        y = SCREEN_HEIGHT // 2 - h // 2
+        dlg_rect = pygame.Rect(x, y, w, h)
+        pygame.draw.rect(self.screen, (35, 35, 45), dlg_rect, border_radius=10)
+        pygame.draw.rect(self.screen, (80, 80, 100), dlg_rect, 2, border_radius=10)
+
+        # Title
+        title = self.title_font.render("Zadaj heslo miestnosti", True, TEXT_COLOR)
+        self.screen.blit(title, title.get_rect(center=(x + w // 2, y + 30)))
+
+        # Password input field
+        pw = input_fields["room_password"]
+        old_rect = pygame.Rect(pw.rect)
+        pw.rect = pygame.Rect(x + 30, y + 65, w - 60, 36)
+        pw.draw(self.screen)
+        pw.rect = old_rect  # restore immediately
+
+        # Buttons — stacked vertically with a gap so they never overlap
+        btn_w, btn_h = w - 60, 38
+        btn_x = x + 30
+        join_y  = y + h - 100   # upper button
+        cancel_y = y + h - 52   # lower button (38 px height + 10 px gap)
+
+        join_rect   = pygame.Rect(btn_x, join_y,   btn_w, btn_h)
+        cancel_rect = pygame.Rect(btn_x, cancel_y, btn_w, btn_h)
+
+        join_color   = (0, 180, 0)   if join_rect.collidepoint(mouse_pos)   else (0, 130, 0)
+        cancel_color = (180, 50, 50) if cancel_rect.collidepoint(mouse_pos) else (130, 30, 30)
+
+        pygame.draw.rect(self.screen, join_color,   join_rect,   border_radius=6)
+        pygame.draw.rect(self.screen, cancel_color, cancel_rect, border_radius=6)
+
+        join_lbl   = self.font.render("Pripojiť sa", True, TEXT_COLOR)
+        cancel_lbl = self.font.render("Zrušiť",      True, TEXT_COLOR)
+        self.screen.blit(join_lbl,   join_lbl.get_rect(center=join_rect.center))
+        self.screen.blit(cancel_lbl, cancel_lbl.get_rect(center=cancel_rect.center))
+
+        # Store button rects on ui_elements so the click handler can use them
+        ui_elements["join_room_btn"].rect  = join_rect
+        ui_elements["cancel_join"].rect    = cancel_rect
+
     def render_game(self, state_manager: StateManager, card_sprites: Dict[int, pygame.sprite.Group],
                     current_room_name: str, mouse_pos: Tuple[int, int],
                     waiting_message: Optional[str], leave_btn: UIElement, end_turn_btn: UIElement) -> None:
-        """Draw the active game screen with cards, piles, and player info."""
         self._draw_background()
 
         if current_room_name:
@@ -773,7 +761,6 @@ class Renderer:
                     player_text = self.font.render(f"Player {slot + 1}: {name}", True, color)
                     self.screen.blit(player_text, player_text.get_rect(center=(SCREEN_WIDTH // 2, y)))
                     y += 40
-                # show room password if available
                 if getattr(state_manager, 'current_room_password', None):
                     pw_surf = self.small_font.render(f"Password: {state_manager.current_room_password}", True,
                                                      TEXT_COLOR)
@@ -791,7 +778,6 @@ class Renderer:
                             if sprite.rect.collidepoint(mouse_pos):
                                 pygame.draw.rect(self.screen, HIGHLIGHT_COLOR, sprite.rect, CARD_HIGHLIGHT_THICKNESS)
 
-            # Draw pile
             draw_pile_rect = self.layout.draw_pile_rect
             if draw_pile_rect.collidepoint(mouse_pos):
                 pygame.draw.rect(self.screen, HIGHLIGHT_COLOR, draw_pile_rect, CARD_HIGHLIGHT_THICKNESS)
@@ -799,13 +785,11 @@ class Renderer:
             if state_manager.game_state.get("draw_pile_count", 0) > 0:
                 self.screen.blit(self.card_back, (draw_pile_rect.x + 3, draw_pile_rect.y + 3))
 
-            # Discard pile
             if state_manager.game_state.get("discard_pile"):
                 top = state_manager.game_state["discard_pile"][-1]
                 card = Card(top["name"], top["value"], top["suit"])
                 card.draw(self.screen, *self.layout.discard_pile_pos)
 
-                # Show chosen suit (if any) near discard pile so all players can see it
                 chosen = state_manager.game_state.get("chosen_suit")
                 if chosen:
                     img = getattr(self, 'suit_images', {}).get(chosen)
@@ -819,7 +803,6 @@ class Renderer:
                         pygame.draw.circle(self.screen, colors_map.get(chosen, (120, 120, 120)),
                                            (dx + CARD_WIDTH + 26, dy + CARD_HEIGHT // 2), 18)
 
-            # Player names
             for i in range(state_manager.num_players):
                 pos_index = (i - state_manager.local_player) % state_manager.num_players
                 name_pos = self.layout.name_positions[pos_index]
@@ -866,7 +849,6 @@ class Renderer:
 
     def render_leaderboard(self, state_manager: StateManager, mouse_pos: Tuple[int, int],
                            leave_btn: UIElement) -> None:
-        """Draw the post-game leaderboard screen."""
         self._draw_background()
 
         title = self.title_font.render("Game Over", True, TEXT_COLOR)
@@ -918,21 +900,17 @@ class EventHandler:
             "play_multiple_cards": True,
             "hornik_changes_suit": True
         }
-        # Dialog state for create-room
         self.room_is_private: bool = False
-        # Pending join dialog state
         self.pending_join_room_id = None
         self.current_room_password = None
 
     @staticmethod
     def validate_ip(ip: str) -> bool:
-        """Validate IPv4 address or localhost."""
         if ip.lower() in ('localhost', '127.0.0.1'):
             return True
         return bool(re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', ip))
 
     def handle_click(self, pos: Tuple[int, int]) -> None:
-        """Route click events to the appropriate screen handler."""
         current_time = pygame.time.get_ticks()
         if current_time - self.last_click_time < CLICK_DEBOUNCE_MS:
             return
@@ -957,7 +935,6 @@ class EventHandler:
         ip_field = self.input_fields["ip"]
         name_field = self.input_fields["name"]
 
-        # Input field focus
         if ip_field.rect.collidepoint(pos):
             ip_field.active = True
             name_field.active = False
@@ -968,7 +945,6 @@ class EventHandler:
             ip_field.active = False
             name_field.active = False
 
-        # Button clicks
         if self.ui_elements["connect"].rect.collidepoint(pos):
             self._handle_connect()
         elif self.ui_elements["close"].rect.collidepoint(pos):
@@ -981,7 +957,6 @@ class EventHandler:
             self._connect_public_server()
 
     def _toggle_lan_server(self) -> None:
-        """Start or stop the LAN server and update button text."""
         btn = self.ui_elements["lan_server"]
         if self.lan_server.running:
             self.lan_server.stop()
@@ -992,15 +967,12 @@ class EventHandler:
             if self.lan_server.start():
                 btn.update_text("Stop LAN Server")
                 btn.bg_color = LAN_ACTIVE_COLOR
-                ip = self.lan_server.local_ip
-                self.state_manager.waiting_message = f"LAN server started on {ip}:{PORT}"
-                # Auto-fill IP address field so the host can connect immediately
-                self.input_fields["ip"].text = ip
+                self.state_manager.waiting_message = f"LAN server started on {self.lan_server.local_ip}:{PORT}"
+                self.input_fields["ip"].text = self.lan_server.local_ip
             else:
                 self.state_manager.waiting_message = "Failed to start LAN server"
 
     def _connect_public_server(self) -> None:
-        """Connect to the public server at 158.101.177.217."""
         self.input_fields["ip"].text = "158.101.177.217"
         name = self.input_fields["name"].text.strip()
         if not name:
@@ -1012,7 +984,6 @@ class EventHandler:
         self._handle_connect()
 
     def _handle_customize_click(self, pos: Tuple[int, int]) -> None:
-        # Background selection
         y = 210
         for bg in self.renderer.background_options:
             rect = pygame.Rect(100, y, 340, 45)
@@ -1027,12 +998,10 @@ class EventHandler:
                 return
             y += 55
 
-        # Card back selection
         y = 210
         for theme in self.renderer.card_back_themes:
             rect = pygame.Rect(SCREEN_WIDTH // 2 + 30, y, 340, 45)
             if rect.collidepoint(pos):
-                # 'theme' here is the filename of the selected back image
                 self.renderer.selected_card_theme = theme
                 self.renderer.current_card_back_path = os.path.join("assets", "cards", "card_backs", theme)
                 self.renderer.load_assets(
@@ -1040,11 +1009,9 @@ class EventHandler:
                     self.renderer.current_card_back_path,
                     (CARD_WIDTH, CARD_HEIGHT)
                 )
-                # Only the back image changes; do not modify front card art
                 return
             y += 55
 
-        # Apply / Cancel → both return to menu
         apply_rect = pygame.Rect(SCREEN_WIDTH // 2 - 220, SCREEN_HEIGHT - 100, 200, 60)
         cancel_rect = pygame.Rect(SCREEN_WIDTH // 2 + 40, SCREEN_HEIGHT - 100, 200, 60)
         if apply_rect.collidepoint(pos) or cancel_rect.collidepoint(pos):
@@ -1056,9 +1023,7 @@ class EventHandler:
         if room_name_field.rect.collidepoint(pos):
             room_name_field.active = True
         elif self.ui_elements["create"].rect.collidepoint(pos):
-            # Open the create-room dialog (single button) instead of sending immediately
             self.state_manager.state = "create_room"
-            # Activate room name input by default
             self.input_fields["room_name"].active = True
             return
         elif self.ui_elements["refresh"].rect.collidepoint(pos):
@@ -1070,57 +1035,18 @@ class EventHandler:
         else:
             room_name_field.active = False
 
-        # Room list click
         rooms_area = pygame.Rect(300, 150, SCREEN_WIDTH - 350, SCREEN_HEIGHT - 200)
         if rooms_area.collidepoint(pos):
             self._handle_room_list_click(pos)
 
-    def _render_join_password(self, mouse_pos: Tuple[int, int]) -> None:
-        """Draw a small modal prompting for room password when joining private rooms."""
-        # Use renderer.screen and fonts from renderer to draw modal
-        screen = self.renderer.screen
-        title_font = self.renderer.title_font
-        small_font = self.renderer.small_font
-
-        overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 160))
-        screen.blit(overlay, (0, 0))
-
-        w, h = 420, 200
-        x = SCREEN_WIDTH // 2 - w // 2
-        y = SCREEN_HEIGHT // 2 - h // 2
-        pygame.draw.rect(screen, (30, 30, 30), pygame.Rect(x, y, w, h), border_radius=8)
-        title = title_font.render("Enter room password", True, TEXT_COLOR)
-        screen.blit(title, title.get_rect(center=(x + w // 2, y + 30)))
-
-        # Password field
-        pw = self.input_fields["room_password"]
-        old_pos = pw.rect.topleft
-        pw.rect.topleft = (x + 30, y + 70)
-        pw.draw(screen)
-
-        # Buttons
-        join_btn = self.ui_elements.get("join_room_btn")
-        cancel_btn = self.ui_elements.get("cancel_join")
-        join_btn.rect.topleft = (x + w - 220, y + h - 70)
-        cancel_btn.rect.topleft = (x + w - 220, y + h - 35)
-        join_btn.draw(screen, mouse_pos)
-        cancel_btn.draw(screen, mouse_pos)
-
-        # restore pw pos
-        pw.rect.topleft = old_pos
-
     def _handle_create_room_click(self, pos: Tuple[int, int]) -> None:
-        """Handle clicks inside the create-room dialog."""
         room_name_field = self.input_fields["room_name"]
         password_field = self.input_fields["room_password"]
 
-        # dialog geometry (must match render_create_room)
         dlg_w, dlg_h = 620, 610
         dlg_x = SCREEN_WIDTH // 2 - dlg_w // 2
         dlg_y = SCREEN_HEIGHT // 2 - dlg_h // 2
 
-        # Field rects inside dialog
         rn_rect = pygame.Rect(dlg_x + 30, dlg_y + 92, dlg_w - 60, 36)
         pw_row_y = dlg_y + 436
         pw_rect = pygame.Rect(dlg_x + 30, pw_row_y + 20, dlg_w - 60, 36)
@@ -1134,7 +1060,6 @@ class EventHandler:
             room_name_field.active = False
             return
 
-        # Player count selector inside dialog
         for i, val in enumerate([2, 3, 4]):
             rect = pygame.Rect(dlg_x + 190 + i * 56, dlg_y + 145, 46, 30)
             if rect.collidepoint(pos):
@@ -1142,7 +1067,6 @@ class EventHandler:
                 self.renderer.selected_room_max_players = val
                 return
 
-        # Rule checkboxes inside dialog
         y = dlg_y + 228
         rule_labels = [
             "stack_sevens",
@@ -1158,13 +1082,11 @@ class EventHandler:
                 return
             y += 30
 
-        # Privacy checkbox
         privacy_rect = pygame.Rect(dlg_x + 30, dlg_y + 404, 18, 18)
         if privacy_rect.collidepoint(pos):
             self.room_is_private = not getattr(self, 'room_is_private', False)
             return
 
-        # Start / Cancel buttons
         btn_y = dlg_y + dlg_h - 58
         start_rect = pygame.Rect(dlg_x + dlg_w - 260, btn_y, 110, 38)
         cancel_rect = pygame.Rect(dlg_x + dlg_w - 135, btn_y, 110, 38)
@@ -1205,7 +1127,6 @@ class EventHandler:
             self.state_manager.state = "lobby"
             return
 
-        # Clicking outside deactivates fields
         room_name_field.active = False
         password_field.active = False
 
@@ -1216,10 +1137,8 @@ class EventHandler:
             if room.get("in_game", False) or room.get("players", 0) >= room.get("max_players", 4):
                 return
             if room.get("is_private"):
-                # open password prompt modal
                 self.state_manager.state = "join_password"
                 self.pending_join_room_id = room.get("room_id")
-                # clear password field and focus it
                 self.input_fields["room_password"].text = ""
                 self.input_fields["room_password"].active = True
             else:
@@ -1230,22 +1149,25 @@ class EventHandler:
             self.network.send_message({"t": "leave_room"})
 
     def _handle_join_password_click(self, pos: Tuple[int, int]) -> None:
-        # dialog geometry must match _render_join_password
-        w, h = 420, 200
+        """
+        Delegate to the button rects that render_join_password() has already
+        written onto the UIElements so coordinates are always in sync.
+        """
+        pw = self.input_fields["room_password"]
+        join_rect   = self.ui_elements["join_room_btn"].rect
+        cancel_rect = self.ui_elements["cancel_join"].rect
+
+        # Approximate password field rect (same formula as in render_join_password)
+        w, h = 440, 240
         x = SCREEN_WIDTH // 2 - w // 2
         y = SCREEN_HEIGHT // 2 - h // 2
-        pw = self.input_fields["room_password"]
-        pw_rect = pygame.Rect(x + 30, y + 70, pw.rect.width, pw.rect.height)
-        join_rect = pygame.Rect(x + w - 220, y + h - 70, self.ui_elements["join_room_btn"].rect.width,
-                                self.ui_elements["join_room_btn"].rect.height)
-        cancel_rect = pygame.Rect(x + w - 220, y + h - 35, self.ui_elements["cancel_join"].rect.width,
-                                  self.ui_elements["cancel_join"].rect.height)
+        pw_rect = pygame.Rect(x + 30, y + 65, w - 60, 36)
 
         if pw_rect.collidepoint(pos):
             pw.active = True
             return
+
         if join_rect.collidepoint(pos):
-            # attempt join with password
             password = pw.text
             room_id = getattr(self, 'pending_join_room_id', None)
             if not room_id:
@@ -1253,19 +1175,18 @@ class EventHandler:
                 self.state_manager.state = "lobby"
                 return
             self.network.send_message({"t": "join_room", "room_id": room_id, "password": password})
-            # save password locally for display in waiting room if join succeeds
             self.current_room_password = password
-            # clear state and return to lobby/await server response
             pw.text = ""
             pw.active = False
             self.state_manager.state = "lobby"
             return
+
         if cancel_rect.collidepoint(pos):
             pw.text = ""
             pw.active = False
             self.state_manager.state = "lobby"
             return
-        # clicking outside
+
         pw.active = False
 
     def _handle_game_click(self, pos: Tuple[int, int]) -> None:
@@ -1278,7 +1199,7 @@ class EventHandler:
                         {"t": "p", "ci": getattr(self.state_manager, 'suit_picker_card_index', -1), "cs": suit})
                     self.state_manager.suit_picker_active = False
                     return
-            return  # Block other interactions while picker is active
+            return
 
         if self.ui_elements["leave_room"].rect.collidepoint(pos):
             self.network.send_message({"t": "leave_room"})
@@ -1289,7 +1210,6 @@ class EventHandler:
                 self.network.send_message({"t": "et"})
                 return
 
-            # Try playing a card
             for i, sprite in enumerate(self.card_sprites[self.state_manager.local_player].sprites()):
                 if sprite.rect.collidepoint(pos):
                     if sprite.card.value == 12 and self.rules.get("hornik_changes_suit", True):
@@ -1299,7 +1219,6 @@ class EventHandler:
                         self.network.send_message({"t": "p", "ci": i})
                     return
 
-            # Map draw pile directly to End Turn
             if self.layout.draw_pile_rect.collidepoint(pos):
                 self.network.send_message({"t": "et"})
 
@@ -1308,21 +1227,16 @@ class EventHandler:
             self.network.send_message({"t": "leave_room"})
 
     def handle_key(self, event) -> None:
-        """Route keyboard events to active input fields."""
         if self.state_manager.state == "menu":
             handled = self.input_fields["ip"].handle_key(event) or self.input_fields["name"].handle_key(event)
             if handled and event.key == pygame.K_RETURN:
                 self._handle_connect()
         elif self.state_manager.state == "create_room":
-            # Handle keys for room creation dialog
             if self.input_fields["room_name"].handle_key(event) and event.key == pygame.K_RETURN:
-                # move focus to password field
                 self.input_fields["room_name"].active = False
                 self.input_fields["room_password"].active = True
                 return
             if self.input_fields["room_password"].handle_key(event) and event.key == pygame.K_RETURN:
-                # submit creation (same as clicking Start Room)
-                # reuse code from create dialog
                 room_name = self.input_fields["room_name"].text.strip()
                 if len(room_name) < 3:
                     self.state_manager.waiting_message = "Room name must be at least 3 characters"
@@ -1339,10 +1253,8 @@ class EventHandler:
                 if getattr(self, 'room_is_private', False):
                     msg["private"] = True
                     msg["password"] = self.input_fields["room_password"].text
-                    # remember password locally so creator sees it in waiting room once joined
                     self.current_room_password = self.input_fields["room_password"].text
                 self.network.send_message(msg)
-                # Clear and return to lobby
                 self.input_fields["room_name"].text = ""
                 self.input_fields["room_password"].text = ""
                 self.input_fields["room_name"].active = False
@@ -1351,7 +1263,6 @@ class EventHandler:
                 self.state_manager.state = "lobby"
                 return
         elif self.state_manager.state == "join_password":
-            # allow submitting password with Enter
             if self.input_fields["room_password"].handle_key(event) and event.key == pygame.K_RETURN:
                 password = self.input_fields["room_password"].text
                 room_id = getattr(self, 'pending_join_room_id', None)
@@ -1360,7 +1271,6 @@ class EventHandler:
                     self.state_manager.state = "lobby"
                     return
                 self.network.send_message({"t": "join_room", "room_id": room_id, "password": password})
-                # keep password for showing in waiting room if join is successful
                 self.state_manager.current_room_password = password
                 self.current_room_password = None
                 self.input_fields["room_password"].text = ""
@@ -1369,13 +1279,11 @@ class EventHandler:
                 return
         elif self.state_manager.state == "lobby":
             if self.input_fields["room_name"].handle_key(event) and event.key == pygame.K_RETURN:
-                # open the create dialog instead of creating immediately
                 self.state_manager.state = "create_room"
                 self.input_fields["room_name"].active = True
                 return
 
     def _handle_connect(self) -> None:
-        """Validate inputs and connect to the server."""
         ip = self.input_fields["ip"].text or "localhost"
         name = self.input_fields["name"].text.strip()
 
@@ -1399,7 +1307,6 @@ class EventHandler:
             self.state_manager.waiting_message = f"Failed to connect to {ip}"
 
     def _create_room(self) -> None:
-        """Send room creation request to the server."""
         room_name = self.input_fields["room_name"].text.strip()
         if len(room_name) >= 3:
             self.network.send_message({
@@ -1411,7 +1318,6 @@ class EventHandler:
             self.input_fields["room_name"].text = ""
 
     def _on_network_message(self, message: dict) -> None:
-        """Process incoming server messages and update state accordingly."""
         self.state_manager.waiting_start = time.time()
         msg_type = message.get("t")
 
@@ -1419,7 +1325,6 @@ class EventHandler:
             self.state_manager.waiting_message = None
 
         elif msg_type == "server_disconnected":
-            # Server closed connection unexpectedly - return user to menu
             self.state_manager.waiting_message = "Server disconnected. Returned to menu."
             try:
                 self.network.disconnect()
@@ -1435,7 +1340,6 @@ class EventHandler:
             self.state_manager.current_room_password = None
 
         elif msg_type == "name_set":
-
             self.player_name = message.get("name", self.player_name)
             self.name_set = True
             self.state_manager.state = "lobby"
@@ -1454,9 +1358,7 @@ class EventHandler:
             self.update_card_sprites()
             self.state_manager.state = "room_waiting"
             self.state_manager.waiting_message = f"Joined room: {self.current_room_name}"
-            # populate password into state for waiting-room display (if user entered it during join)
             self.state_manager.current_room_password = getattr(self, 'current_room_password', None)
-            # clear local copy now that it's stored in state_manager
             self.current_room_password = None
 
         elif msg_type == "player_joined":
@@ -1519,11 +1421,6 @@ class EventHandler:
             self.state_manager.waiting_message = f"Error: {message.get('msg', 'Unknown error')}"
 
     def update_card_sprites(self) -> None:
-        """Rebuild card sprite groups from current game state.
-
-        Use the currently selected card back image for non-local players so the chosen
-        design appears on other players' cards as well.
-        """
         if not self.state_manager.game_state or self.state_manager.local_player is None:
             return
 
@@ -1533,7 +1430,6 @@ class EventHandler:
                 self.card_sprites[i] = pygame.sprite.Group()
             self.card_sprites[i].empty()
 
-        # Prepare a back-card object using the renderer's current card_back surface
         back_card = None
         if self.renderer.card_back:
             try:
@@ -1561,7 +1457,6 @@ class EventHandler:
                 if is_local:
                     display_card = card
                 else:
-                    # Prefer the rendered back_card surface; fall back to a generic cached 'back' Card
                     if back_card:
                         display_card = back_card
                     else:
@@ -1570,7 +1465,7 @@ class EventHandler:
 
 
 class MultiRoomClient:
-    """Main application class that ties together all game components."""
+    """Main application class."""
 
     def __init__(self):
         pygame.init()
@@ -1602,63 +1497,58 @@ class MultiRoomClient:
             (CARD_WIDTH, CARD_HEIGHT)
         )
 
-        # Preload card images (fronts only)
         suits = ["srdce", "zelen", "zalud", "gula"]
         value_names = {7: "7", 8: "8", 9: "9", 10: "10", 11: "dolnik", 12: "hornik", 13: "kral", 14: "eso"}
         card_names = [f"{value_names[v]}_{s}" for s in suits for v in value_names]
-        # Front card art remains the default set; back images are loaded separately from card_backs
         Card.preload_images(card_names)
 
     def _setup_ui(self) -> None:
-        """Initialize all input fields and UI buttons."""
         cx = SCREEN_WIDTH // 2
         cy = SCREEN_HEIGHT // 2
 
         self.input_fields = {
-            "ip": InputField(pygame.Rect(cx - 150, cy - 160, 300, 40), "Server IP", self.font, BUTTON_COLOR, 20),
-            "name": InputField(pygame.Rect(cx - 150, cy - 80, 300, 40), "Username", self.font, BUTTON_COLOR, 20),
+            "ip": InputField(pygame.Rect(cx - 150, cy - 150, 300, 40), "Server IP", self.font, BUTTON_COLOR, 20),
+            "name": InputField(pygame.Rect(cx - 150, cy - 70, 300, 40), "Username", self.font, BUTTON_COLOR, 20),
             "room_name": InputField(pygame.Rect(50, 260, 200, 40), "Room name", self.font, BUTTON_COLOR, 30),
-            "room_password": InputField(pygame.Rect(50, 360, 200, 40), "Password (if private)", self.font, BUTTON_COLOR,
-                                        30, is_password=True),
+            "room_password": InputField(pygame.Rect(50, 360, 200, 40), "Password (if private)", self.font,
+                                        BUTTON_COLOR, 30, is_password=True),
         }
 
         self.ui_elements = {
-            "connect": UIElement(pygame.Rect(cx - 75, cy + 10, 150, 40), "Connect", self.font, BUTTON_COLOR),
-            "close": UIElement(pygame.Rect(cx - 75, cy + 60, 150, 40), "Close", self.font, BUTTON_COLOR),
+            "connect": UIElement(pygame.Rect(cx - 75, cy - 10, 150, 40), "Connect", self.font, BUTTON_COLOR),
+            "close": UIElement(pygame.Rect(cx - 75, cy + 50, 150, 40), "Close", self.font, BUTTON_COLOR),
             "create": UIElement(pygame.Rect(50, 150, 200, 40), "Create Room", self.font, BUTTON_COLOR),
             "refresh": UIElement(pygame.Rect(50, 200, 200, 40), "Refresh Rooms", self.font, BUTTON_COLOR),
-            "disconnect": UIElement(pygame.Rect(10, SCREEN_HEIGHT - 50, 160, 36), "Disconnect", self.font,
+            "disconnect": UIElement(pygame.Rect(50, SCREEN_HEIGHT - 60, 200, 40), "Disconnect", self.font,
                                     BUTTON_COLOR),
-            "leave_room": UIElement(pygame.Rect(10, SCREEN_HEIGHT - 50, 130, 36), "Leave Room", self.font,
+            "leave_room": UIElement(pygame.Rect(50, SCREEN_HEIGHT - 60, 150, 40), "Leave Room", self.font,
                                     BUTTON_COLOR),
             "customize": UIElement(
-                pygame.Rect(10, SCREEN_HEIGHT - 55, 150, 36),
+                pygame.Rect(20, SCREEN_HEIGHT - 80, 180, 60),
                 "Customize", self.font, CUSTOMIZE_BUTTON_COLOR
             ),
             "lan_server": UIElement(
-                pygame.Rect(SCREEN_WIDTH - 210, SCREEN_HEIGHT - 55, 200, 40),
+                pygame.Rect(SCREEN_WIDTH - 230, SCREEN_HEIGHT - 65, 210, 45),
                 "Start LAN Server", self.font, LAN_INACTIVE_COLOR,
                 hover_color=(180, 80, 80)
             ),
             "public_server": UIElement(
-                pygame.Rect(cx - 100, cy + 115, 200, 40),
+                pygame.Rect(cx - 115, cy + 120, 230, 45),
                 "Public Server", self.font, (40, 100, 160),
                 hover_color=(60, 140, 220)
             ),
             "end_turn": UIElement(
-                pygame.Rect(cx + 60, SCREEN_HEIGHT - 220, 160, 38),
+                pygame.Rect(cx + 80, SCREEN_HEIGHT - 60, 150, 40),
                 "Koniec Ťahu", self.font, (180, 80, 40), hover_color=(220, 100, 60)
             ),
-            # Create-room dialog buttons
             "start_room": UIElement(pygame.Rect(50, 420, 200, 40), "Start Room", self.font, (0, 150, 0)),
             "cancel_create": UIElement(pygame.Rect(50, 470, 200, 40), "Cancel", self.font, (150, 0, 0)),
-            # Join-password dialog buttons
-            "join_room_btn": UIElement(pygame.Rect(0, 0, 180, 40), "Join", self.font, (0, 150, 0)),
-            "cancel_join": UIElement(pygame.Rect(0, 0, 180, 40), "Cancel", self.font, (150, 0, 0)),
+            # Join-password buttons — rects are set at render time by render_join_password()
+            "join_room_btn": UIElement(pygame.Rect(0, 0, 380, 38), "Pripojiť sa", self.font, (0, 130, 0)),
+            "cancel_join": UIElement(pygame.Rect(0, 0, 380, 38), "Zrušiť", self.font, (130, 30, 30)),
         }
 
     def run(self) -> None:
-        """Main game loop."""
         clock = pygame.time.Clock()
 
         while self.running:
@@ -1670,11 +1560,9 @@ class MultiRoomClient:
                 elif event.type == pygame.KEYDOWN:
                     self.event_handler.handle_key(event)
 
-            # Process network messages
             while not self.network.message_queue.empty():
                 self.event_handler._on_network_message(self.network.message_queue.get())
 
-            # Auto-return from leaderboard
             if (self.state_manager.state == "leaderboard" and
                     time.time() - self.state_manager.leaderboard_start > LEADERBOARD_DURATION):
                 self.network.send_message({"t": "leave_room"})
@@ -1692,7 +1580,6 @@ class MultiRoomClient:
         self._cleanup()
 
     def _render(self, mouse_pos: Tuple[int, int]) -> None:
-        """Render the current screen based on state."""
         state = self.state_manager.state
 
         if state == "menu":
@@ -1717,7 +1604,6 @@ class MultiRoomClient:
                 self.event_handler.rules
             )
         elif state == "create_room":
-            # Render the create-room dialog overlay
             self.renderer.render_create_room(
                 self.input_fields,
                 self.ui_elements,
@@ -1736,10 +1622,22 @@ class MultiRoomClient:
                 self.ui_elements["leave_room"],
                 self.ui_elements["end_turn"]
             )
+
         elif state == "join_password":
-            # render a simple join-password prompt overlay
-            # render via event handler where the modal method actually lives
-            self.event_handler._render_join_password(mouse_pos)
+            # Render lobby in background, then draw the password modal on top
+            self.renderer.render_lobby(
+                self.renderer.current_background_path,
+                self.event_handler.player_name,
+                self.input_fields["room_name"],
+                self.ui_elements["create"], self.ui_elements["refresh"],
+                self.ui_elements["disconnect"],
+                self.event_handler.rooms_list,
+                None,
+                self.event_handler.rules
+            )
+            self.renderer.render_join_password(
+                self.input_fields, self.ui_elements, mouse_pos
+            )
 
         elif state == "leaderboard":
             self.renderer.render_leaderboard(
@@ -1751,7 +1649,6 @@ class MultiRoomClient:
             self.renderer.render_customize(mouse_pos)
 
     def _cleanup(self) -> None:
-        """Clean up resources on exit."""
         self.lan_server.stop()
         self.network.disconnect()
         pygame.quit()
