@@ -30,7 +30,7 @@ from game_logic import Game
 # --- Configuration ---
 PORT = 65432
 HOST = '0.0.0.0'
-MAX_ROOMS = 10
+MAX_ROOMS = 30
 MAX_PLAYERS_PER_ROOM = 4
 STATS_INTERVAL = 300
 ROOM_TIMEOUT = 3600
@@ -123,6 +123,12 @@ class GameRoom:
         self.last_game_state: Optional[dict] = None
         self.created_at = datetime.now()
         self.last_activity = time.time()
+        self.leader_sock: socket.socket = creator.sock
+        self.tournament_mode: bool = False
+        self.tournament_round: int = 0
+        self.tournament_penalties: Dict[int, int] = {}
+        self.tournament_eliminated: Set[int] = set()
+        self.tournament_last_loser: Optional[int] = None
 
         self._add_player(creator)
 
@@ -167,6 +173,10 @@ class GameRoom:
                 self.players[i] = None
                 self.sockets.discard(sock)
                 self.last_activity = time.time()
+                if sock == self.leader_sock:
+                    remaining = [p for p in self.players if p is not None]
+                    if remaining:
+                        self.leader_sock = remaining[0].sock
                 return True
         return False
 
@@ -176,21 +186,49 @@ class GameRoom:
     def is_full(self) -> bool:
         return all(p is not None for p in self.players)
 
-    def can_start_game(self) -> bool:
-        return (len([p for p in self.players if p]) == self.max_players
+    def can_start_game(self, manual: bool = False) -> bool:
+        player_count = len([p for p in self.players if p])
+        if manual:
+            return player_count >= 2 and self.game is None and not self.game_ended
+        return (player_count == self.max_players
                 and self.game is None and not self.game_ended)
 
-    def start_game(self) -> bool:
-        if not self.can_start_game():
+    def start_game(self, manual: bool = False) -> bool:
+        if not self.can_start_game(manual):
             return False
+        # Always use max_players so slot indices match room.players indices
         self.game = Game(self.max_players, self.rules)
         self.game.create_deck()
-        self.game.deal_cards()
+
+        if self.tournament_mode:
+            self.tournament_round += 1
+            # hand_sizes uses room slot indices; eliminated/absent slots get 0
+            hand_sizes = {}
+            for i in range(self.max_players):
+                if self.players[i] is None:
+                    hand_sizes[i] = 0
+                elif i in self.tournament_eliminated:
+                    hand_sizes[i] = 0
+                else:
+                    hand_sizes[i] = max(0, 5 - self.tournament_penalties.get(i, 0))
+            self.game.deal_cards(hand_sizes)
+            logger.info(f"Tournament round {self.tournament_round} in '{self.room_name}', hand_sizes={hand_sizes}")
+        else:
+            # Normal mode: absent slots get 0 cards
+            hand_sizes = {i: (5 if self.players[i] is not None else 0)
+                          for i in range(self.max_players)}
+            self.game.deal_cards(hand_sizes)
+
+        # Choose a random starting player among active (non-eliminated, present) slots
+        occupied_slots = [i for i, p in enumerate(self.players)
+                          if p and i not in self.tournament_eliminated]
+        if occupied_slots:
+            self.game.current_player = random.choice(occupied_slots)
+            logger.info(f"Starting player for room '{self.room_name}' is Player {self.game.current_player + 1}")
         self.finish_order = []
         self.disconnected = set()
-        self.last_activity = time.time()
         player_count = len([p for p in self.players if p])
-        logger.info(f"Game started in '{self.room_name}' with {player_count} players")
+        logger.info(f"Game started in room '{self.room_name}' with {player_count} players")
         return True
 
     def is_stale(self) -> bool:
@@ -265,6 +303,7 @@ class RoomManager:
         room_id = str(uuid.uuid4())
         creator = Player(sock, creator_name, 0)
         room = GameRoom(room_id, room_name, creator, max_players, rules, is_private, password)
+        room.tournament_mode = rules.get('tournament_mode', False)
         self.rooms[room_id] = room
         self.client_rooms[sock] = room_id
         return room_id
@@ -303,8 +342,11 @@ class RoomManager:
                     "t": "player_left",
                     "player_name": player_name,
                     "players_count": len([p for p in room.players if p]),
-                    "player_names": room.player_names
+                    "player_names": room.player_names,
+                    "new_leader_sock_id": id(room.leader_sock)
                 }, server=server)
+                if room.leader_sock in room.sockets:
+                    server.send_message(room.leader_sock, {"t": "you_are_leader"})
 
                 if room.game:
                     game_state = room.game.serialize()
@@ -312,6 +354,11 @@ class RoomManager:
                         "t": "gs", **game_state,
                         "player_names": room.player_names
                     }, server=server)
+
+                # Tournament: if only 1 player left, end as final
+                remaining = [p for p in room.players if p]
+                if room.tournament_mode and room.game and len(remaining) <= 1:
+                    self.end_game(room_id, server, lobby)
 
                 if room.is_empty():
                     try:
@@ -382,38 +429,127 @@ class RoomManager:
         if not room.game:
             return
 
-        winner = next((i for i, p in enumerate(room.game.players) if not p), None)
+        # In tournament final, winner = last active non-eliminated player
+        # In normal game, winner = first player to empty their hand
+        if room.tournament_mode and room.tournament_eliminated:
+            active_now = [i for i in range(room.max_players)
+                          if room.players[i] and i not in room.tournament_eliminated]
+            winner = active_now[0] if len(active_now) == 1 else (
+                next((i for i, p in enumerate(room.game.players) if not p and i in room.game.active_slots), None)
+            )
+        else:
+            winner = next((i for i, p in enumerate(room.game.players) if not p), None)
+
+        # Build results: winner first (fewest/no cards), then by cards ascending
+        remaining = [(i, len(room.game.players[i]))
+                     for i in range(room.max_players)
+                     if i not in room.finish_order and i in room.player_names]
+        remaining.sort(key=lambda x: x[1])
 
         results = []
+        # Players who finished (emptied hand) — rank 1 first
         for pid in room.finish_order:
             results.append({
                 "pid": pid, "rank": len(results) + 1,
                 "cards_left": 0, "disconnected": pid in room.disconnected
             })
-
-        remaining = [(i, len(room.game.players[i]))
-                     for i in range(room.max_players) if i not in room.finish_order]
-        remaining.sort(key=lambda x: x[1])
+        # Remaining players sorted by cards left (fewest first)
         for pid, cards_left in remaining:
             results.append({
                 "pid": pid, "rank": len(results) + 1,
                 "cards_left": cards_left, "disconnected": pid in room.disconnected
             })
 
-        winner_str = f"Player {winner + 1}" if winner is not None else "none"
-        logger.info(f"Game over in '{room.room_name}', winner: {winner_str}")
+        if room.tournament_mode:
+            # Tournament ranking: survivor = rank 1, most penalised = last
+            # Sort by penalty ascending (fewer penalties = better rank)
+            all_pids = [r["pid"] for r in results]
+            all_pids.sort(key=lambda p: room.tournament_penalties.get(p, 0))
+            results = [{
+                "pid": p,
+                "rank": i + 1,
+                "cards_left": len(room.game.players[p]) if p < len(room.game.players) else 0,
+                "disconnected": p in room.disconnected
+            } for i, p in enumerate(all_pids)]
 
-        self.broadcast_to_room(room_id, {
-            "t": "go",
-            "w": winner + 1 if winner is not None else None,
-            "results": results,
-            "player_names": room.player_names
-        }, server=server)
+        winner_str = f"Player {winner + 1}" if winner is not None else "none"
+        logger.info(f"Game over in room '{room.room_name}', winner: {winner_str}")
 
         room.game = None
-        room.game_ended = True
         room.last_game_state = None
         room.finish_order = []
+
+        if room.tournament_mode:
+            # Last place gets a penalty
+            if results:
+                loser_pid = results[-1]["pid"]
+                if loser_pid not in room.tournament_eliminated:
+                    current_penalty = room.tournament_penalties.get(loser_pid, 0)
+                    new_penalty = current_penalty + 1
+                    room.tournament_penalties[loser_pid] = new_penalty
+                    cards_next = max(0, 5 - new_penalty)
+                    logger.info(f"Tournament: Player {loser_pid + 1} penalty={new_penalty}, next hand={cards_next}")
+                    if cards_next <= 0:
+                        room.tournament_eliminated.add(loser_pid)
+                        logger.info(f"Tournament: Player {loser_pid + 1} eliminated!")
+
+            # Count active (non-eliminated, still connected) players
+            active = [i for i, p in enumerate(room.players)
+                      if p and i not in room.tournament_eliminated]
+
+            # Attach tournament info to results
+            penalties_info = {}
+            for i in range(room.max_players):
+                if room.players[i]:
+                    pen = room.tournament_penalties.get(i, 0)
+                    penalties_info[i] = {
+                        "cards_next": max(0, 5 - pen),
+                        "eliminated": i in room.tournament_eliminated
+                    }
+
+            connected_active = [i for i in active if room.players[i] is not None]
+            # Also end tournament if nobody is active (all eliminated this round)
+            if len(connected_active) == 0 or len(connected_active) <= 1:
+                # Tournament over — send final game over (clients show leaderboard)
+                self.broadcast_to_room(room_id, {
+                    "t": "go",
+                    "w": winner + 1 if winner is not None else None,
+                    "results": results,
+                    "player_names": room.player_names,
+                    "tournament_final": True
+                }, server=server)
+
+                # Mark game ended and schedule post-leaderboard cleanup (delay so clients can show leaderboard)
+                room.game = None
+                room.last_game_state = None
+                room.finish_order = []
+                room.game_ended = True
+                room.leaderboard_show_until = time.time() + 5.0  # seconds before moving players back to lobby
+            else:
+                # Round over — send round results then start next round after delay
+                for r in results:
+                    pid = r["pid"]
+                    r["cards_next"] = penalties_info.get(pid, {}).get("cards_next", 5)
+                    r["eliminated"] = penalties_info.get(pid, {}).get("eliminated", False)
+                self.broadcast_to_room(room_id, {
+                    "t": "tournament_round_over",
+                    "results": results,
+                    "player_names": room.player_names,
+                    "round": room.tournament_round,
+                    "penalties": {str(k): v for k, v in penalties_info.items()}
+                }, server=server)
+                # Schedule next round start (server loop will pick it up)
+                room.tournament_next_round_at = time.time() + 5.0
+        else:
+            self.broadcast_to_room(room_id, {
+                "t": "go",
+                "w": winner + 1 if winner is not None else None,
+                "results": results,
+                "player_names": room.player_names
+            }, server=server)
+            # Schedule showing leaderboard before moving players back to lobby
+            room.game_ended = True
+            room.leaderboard_show_until = time.time() + 5.0
 
 
 class MessageHandler:
@@ -468,7 +604,8 @@ class MessageHandler:
                 logger.info(f"Room '{room_name}' ({max_players}p) created by {creator_name}")
                 self.server.send_message(sock, {
                     "t": "room_joined", "room_id": room_id, "room_name": room_name,
-                    "player_slot": 0, "max_players": max_players, "player_names": {0: creator_name}
+                    "player_slot": 0, "max_players": max_players, "player_names": {0: creator_name},
+                    "is_leader": True
                 })
                 self.lobby.broadcast(
                     {"t": "room_list_update", "rooms": self.rooms.get_available_rooms_info()},
@@ -485,7 +622,7 @@ class MessageHandler:
             password = message.get("password")
             slot = self.rooms.join_room(sock, room_id, self.server.client_names[sock], password)
             if slot == -1:
-                self.server.send_message(sock, {"t": "e", "msg": "Nesprávne heslo!"})
+                self.server.send_message(sock, {"t": "e", "msg": "Incorrect password!"})
                 return
             elif slot is not None:
                 self.server.lobby.remove_client(sock)
@@ -495,19 +632,17 @@ class MessageHandler:
                 logger.info(f"{player_name} joined '{room.room_name}' as Player {slot + 1}")
                 self.server.send_message(sock, {
                     "t": "room_joined", "room_id": room_id, "room_name": room.room_name,
-                    "player_slot": slot, "max_players": room.max_players, "player_names": room.player_names
+                    "player_slot": slot, "max_players": room.max_players, "player_names": room.player_names,
+                    "is_leader": False
                 })
                 self.rooms.broadcast_to_room(room_id, {
                     "t": "player_joined", "player_name": player_name, "player_slot": slot,
                     "players_count": players_count, "player_names": room.player_names
                 }, server=self.server)
-                if room.can_start_game():
-                    room.start_game()
-                    self._broadcast_game_state(room_id)
-                else:
-                    self.rooms.broadcast_to_room(room_id, {
-                        "t": "waiting", "players_needed": room.max_players - players_count
-                    }, server=self.server)
+                # Never auto-start — leader must press Start Game
+                self.rooms.broadcast_to_room(room_id, {
+                    "t": "waiting", "players_needed": room.max_players - players_count
+                }, server=self.server)
                 self.lobby.broadcast(
                     {"t": "room_list_update", "rooms": self.rooms.get_available_rooms_info()},
                     server=self.server
@@ -528,6 +663,15 @@ class MessageHandler:
 
         if msg_type == "leave_room":
             self.rooms.leave_room(sock, self.server, self.lobby)
+
+        elif msg_type == "start_game":
+            if sock != room.leader_sock:
+                self.server.send_message(sock, {"t": "e", "msg": "Only the room leader can start the game"})
+                return
+            if room.start_game(manual=True):
+                self._broadcast_game_state(room_id)
+            else:
+                self.server.send_message(sock, {"t": "e", "msg": "Cannot start game (need at least 2 players)"})
 
         elif room.game:
             player_slot = next((p.slot for p in room.players if p and p.sock == sock), -1)
@@ -696,6 +840,37 @@ class DedicatedServer:
                     if room.game and room.game.check_game_over():
                         self.rooms.end_game(room_id, self, self.lobby)
                         self.total_games += 1
+
+                if (not room.game and not room.game_ended
+                        and room.tournament_mode
+                        and hasattr(room, 'tournament_next_round_at')
+                        and time.time() >= room.tournament_next_round_at):
+                    del room.tournament_next_round_at
+                    room.start_game(manual=True)
+                    self.message_handler._broadcast_game_state(room_id)
+
+                # If leaderboard display time expired for a finished game, move players back to lobby and remove room
+                if getattr(room, 'game_ended', False) and getattr(room, 'leaderboard_show_until', 0) and time.time() >= room.leaderboard_show_until:
+                    logger.info(f"Post-leaderboard cleanup for room: {room.room_name}")
+                    for p in list(room.players):
+                        if p:
+                            try:
+                                self.rooms.client_rooms.pop(p.sock, None)
+                            except Exception:
+                                pass
+                            try:
+                                self.lobby.add_client(p.sock)
+                                self.send_message(p.sock, {"t": "back_to_lobby"})
+                                self.lobby.send_room_list(p.sock, self.rooms, self)
+                            except Exception:
+                                pass
+                    try:
+                        self.lobby.player_room_created.pop(room.creator.name, None)
+                    except Exception:
+                        pass
+                    del self.rooms.rooms[room_id]
+                    self.lobby.broadcast({"t": "room_list_update", "rooms": self.rooms.get_available_rooms_info()}, server=self)
+                    continue
 
                 if room.is_empty():
                     logger.info(f"Removing empty room: {room.room_name}")

@@ -25,6 +25,31 @@ logger = logging.getLogger(__name__)
 SCREEN_WIDTH = 1280
 SCREEN_HEIGHT = 720
 PORT = 65432
+
+# Support running the bundled executable in headless server mode.
+# When the application executable is invoked with --run-server, start the
+# server loop and exit. This allows launching the same .exe as a background
+# server subprocess (used by LanServerManager) without creating a GUI.
+if "--run-server" in sys.argv:
+    try:
+        # parse optional --port after --run-server
+        port = PORT
+        try:
+            idx = sys.argv.index("--run-server")
+            if "--port" in sys.argv[idx+1:]:
+                pidx = sys.argv.index("--port", idx+1)
+                port = int(sys.argv[pidx+1])
+        except Exception:
+            port = PORT
+        import server as _embedded_server
+        _srv = _embedded_server.MultiRoomServer(port)
+        _srv.start()
+    except Exception as _e:
+        # If server startup fails in this mode, print and exit with error
+        print(f"Server (headless) failed to start: {_e}")
+    finally:
+        sys.exit(0)
+
 CARD_WIDTH, CARD_HEIGHT = 80, 142
 CARD_HIGHLIGHT_THICKNESS = 3
 CLICK_DEBOUNCE_MS = 200
@@ -202,7 +227,7 @@ class LayoutManager:
         if is_local:
             offset = base_offset if num_cards <= 8 else max(35, base_offset - (num_cards - 8) * 3)
         else:
-            offset = max(14, base_offset - max(0, (num_cards - 2) * 8))
+            offset = max(14, base_offset - max(0, (num_cards - 2) * 8)) - 6
 
         if pos_index in (0, 2):
             x = pos["x"] - (num_cards * offset // 2) + (card_index * offset)
@@ -395,6 +420,15 @@ class StateManager:
         self.leaderboard_data: Optional[List[Dict]] = None
         self.target_private_room_id: Optional[str] = None
         self.dealing_animation: bool = False
+        self.tournament_round_over: bool = False
+        self.room_rules: dict = {}
+        self.show_credits: bool = False
+        self.tournament_results: Optional[List[Dict]] = None
+        self.tournament_round: int = 0
+        self.tournament_penalties: dict = {}
+        # Holds "go" data while waiting 2s before showing leaderboard
+        self.leaderboard_pending: bool = False
+        self.leaderboard_pending_start: float = 0
 
 
 class LanServerManager:
@@ -420,25 +454,64 @@ class LanServerManager:
     def start(self) -> bool:
         if self.running:
             return False
+
+        # Prefer embedding the server in-process (thread). If that fails
+        # (e.g. module import issues in bundled exe), fall back to launching
+        # the same executable in headless server mode as a subprocess inside
+        # a background thread.
         try:
-            server_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server.py")
-            creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-            self.process = subprocess.Popen(
-                [sys.executable, server_script, "--port", str(PORT)],
-                creationflags=creation_flags
-            )
-            time.sleep(0.5)
-            if self.process.poll() is not None:
-                self.process = None
-                return False
+            import server as server_mod
+            # Create server without installing signal handlers when embedding
+            self.server_instance = server_mod.MultiRoomServer(PORT, install_signal_handler=False)
+            t = threading.Thread(target=self.server_instance.start, daemon=True)
+            t.start()
+            self.server_thread = t
             self.local_ip = self.get_local_ip()
             self.running = True
             return True
-        except Exception as e:
-            logger.error(f"Failed to start LAN server: {e}")
-            return False
+        except Exception:
+            # Fall back to subprocess-in-thread approach
+            def _run_subprocess():
+                try:
+                    creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+                    # Launch the same executable with --run-server so it starts the server loop
+                    cmd = [sys.executable, sys.argv[0], "--run-server", "--port", str(PORT)]
+                    proc = subprocess.Popen(cmd, creationflags=creation_flags)
+                    self.process = proc
+                    proc.wait()
+                except Exception as e:
+                    logger.error(f"LAN server subprocess failed: {e}")
+                finally:
+                    self.running = False
+                    self.local_ip = None
+
+            thread = threading.Thread(target=_run_subprocess, daemon=True)
+            thread.start()
+            # give the subprocess a moment to start
+            time.sleep(0.5)
+            if self.process is None or self.process.poll() is not None:
+                return False
+            self.running = True
+            self.local_ip = self.get_local_ip()
+            return True
 
     def stop(self) -> None:
+        # Stop embedded server if running
+        if getattr(self, 'server_instance', None):
+            try:
+                try:
+                    self.server_instance.server_socket.close()
+                except Exception:
+                    pass
+                try:
+                    self.server_instance.sel.close()
+                except Exception:
+                    pass
+            finally:
+                self.server_instance = None
+                self.server_thread = None
+
+        # Stop subprocess if used
         if self.process:
             try:
                 self.process.terminate()
@@ -449,6 +522,7 @@ class LanServerManager:
                 except Exception:
                     pass
             self.process = None
+
         self.running = False
         self.local_ip = None
 
@@ -466,11 +540,13 @@ class Renderer:
         self.background: Optional[pygame.Surface] = None
         self.card_back: Optional[pygame.Surface] = None
 
-        self.background_options = [
-            "background_green.png",
-            "background_blue.png",
-            "background_red.png",
-        ]
+        bg_dir = os.path.join("assets", "backgrounds")
+        try:
+            bgs = [f for f in os.listdir(bg_dir) if f.lower().endswith((".png", ".jpg", ".bmp"))]
+            bgs.sort()
+            self.background_options = bgs if bgs else ["background_green.png"]
+        except OSError:
+            self.background_options = ["background_green.png"]
         backs_dir = os.path.join("assets", "cards", "card_backs")
         try:
             backs = [f for f in os.listdir(backs_dir) if f.lower().endswith((".png", ".jpg", ".bmp"))]
@@ -499,6 +575,9 @@ class Renderer:
                 self.suit_images[s] = fallback
 
         self.selected_room_max_players = 4
+
+        # Window size customization removed — client will keep default screen dimensions.
+        # (Resolution options were intentionally removed to simplify the Customize screen.)
 
     def load_assets(self, background_path: str, card_back_path: str, size: Tuple[int, int]) -> None:
         try:
@@ -562,6 +641,36 @@ class Renderer:
             msg_surface = self.font.render(waiting_message, True, msg_color)
             self.screen.blit(msg_surface, msg_surface.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 185)))
 
+    def render_public_menu(self, name_field: InputField, connect_btn: UIElement, close_btn: UIElement,
+                           customize_btn: UIElement, back_to_lan_btn: UIElement, waiting_message: Optional[str]) -> None:
+        self._draw_background()
+
+        # Main title and smaller 'Public server' subtitle (position matches main menu)
+        main_title = self.title_font.render("Sedma Bere Tri", True, TEXT_COLOR)
+        self.screen.blit(main_title, main_title.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 - 250)))
+        subtitle = self.small_font.render("Public server", True, PLACEHOLDER_COLOR)
+        self.screen.blit(subtitle, subtitle.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 - 210)))
+
+        # Name field (centered similar to main menu)
+        name_label = self.font.render("Your Name:", True, TEXT_COLOR)
+        self.screen.blit(name_label, (name_field.rect.x, name_field.rect.y - 30))
+        name_field.draw(self.screen)
+
+        mouse_pos = pygame.mouse.get_pos()
+        connect_btn.draw(self.screen, mouse_pos)
+        close_btn.draw(self.screen, mouse_pos)
+        customize_btn.draw(self.screen, mouse_pos)
+
+        # Back to LAN button (top-right)
+        if back_to_lan_btn:
+            back_to_lan_btn.draw(self.screen, mouse_pos)
+
+        if waiting_message:
+            is_error = "error" in waiting_message.lower() or "please" in waiting_message.lower()
+            msg_color = ERROR_COLOR if is_error else TEXT_COLOR
+            msg_surface = self.font.render(waiting_message, True, msg_color)
+            self.screen.blit(msg_surface, msg_surface.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 80)))
+
     def render_customize(self, mouse_pos: Tuple[int, int]) -> None:
         self._draw_background()
 
@@ -569,57 +678,76 @@ class Renderer:
         self.screen.blit(title, title.get_rect(center=(SCREEN_WIDTH // 2, 80)))
 
         bg_title = self.font.render("Background", True, TEXT_COLOR)
-        self.screen.blit(bg_title, (120, 160))
+        self.screen.blit(bg_title, bg_title.get_rect(center=(SCREEN_WIDTH // 4, 160)))
 
-        y = 210
-        for bg in self.background_options:
-            rect = pygame.Rect(100, y, 340, 45)
-            color = (0, 180, 0) if bg == self.selected_background else (
-                CUSTOMIZE_HOVER_COLOR if rect.collidepoint(mouse_pos) else BUTTON_COLOR)
+        # Arrow selector for background — no preview, background is visible behind
+        bcx = SCREEN_WIDTH // 4
+        bsel_y = 290
+        barr_w, barr_h = 44, 44
+        bleft_rect  = pygame.Rect(bcx - 80, bsel_y - barr_h // 2, barr_w, barr_h)
+        bright_rect = pygame.Rect(bcx + 36, bsel_y - barr_h // 2, barr_w, barr_h)
+        for rect, symbol in [(bleft_rect, "<"), (bright_rect, ">")]:
+            color = CUSTOMIZE_HOVER_COLOR if rect.collidepoint(mouse_pos) else BUTTON_COLOR
             pygame.draw.rect(self.screen, color, rect, border_radius=8)
-            label = self.font.render(bg.replace(".png", "").replace("_", " ").title(), True, TEXT_COLOR)
-            self.screen.blit(label, (130, y + 10))
-            y += 55
+            sym = self.title_font.render(symbol, True, TEXT_COLOR)
+            self.screen.blit(sym, sym.get_rect(center=rect.center))
+        lbl = self.font.render("Change background", True, TEXT_COLOR)
+        self.screen.blit(lbl, lbl.get_rect(center=(bcx, bsel_y - 40)))
+
+        if self.background_options:
+            bidx = self.background_options.index(self.selected_background) if self.selected_background in self.background_options else 0
+            bcounter = self.small_font.render(f"{bidx + 1} / {len(self.background_options)}", True, PLACEHOLDER_COLOR)
+            self.screen.blit(bcounter, bcounter.get_rect(center=(bcx, bsel_y + barr_h // 2 + 20)))
 
         card_title = self.font.render("Deck Design", True, TEXT_COLOR)
-        self.screen.blit(card_title, (SCREEN_WIDTH // 2 + 50, 160))
+        self.screen.blit(card_title, card_title.get_rect(center=(SCREEN_WIDTH * 3 // 4, 160)))
 
-        y = 210
-        for theme in self.card_back_themes:
-            rect = pygame.Rect(SCREEN_WIDTH // 2 + 30, y, 340, 45)
-            color = (0, 180, 0) if theme == self.selected_card_theme else (
-                CUSTOMIZE_HOVER_COLOR if rect.collidepoint(mouse_pos) else BUTTON_COLOR)
-            pygame.draw.rect(self.screen, color, rect, border_radius=8)
-            label_text = os.path.splitext(theme)[0].replace("_", " ").title()
-            label = self.font.render(label_text, True, TEXT_COLOR)
-            self.screen.blit(label, (SCREEN_WIDTH // 2 + 60, y + 10))
-            y += 55
+        # Arrow selector for card back
+        cx = SCREEN_WIDTH * 3 // 4
+        sel_y = 290
 
-        preview_x = SCREEN_WIDTH // 2 + 400
-        preview_y = 210
-        preview_title = self.font.render("Back Preview", True, TEXT_COLOR)
-        self.screen.blit(preview_title, (preview_x, preview_y - 30))
-        preview_size = (int(CARD_WIDTH * 0.75), int(CARD_HEIGHT * 0.75))
+        # Large card preview
+        preview_size = (int(CARD_WIDTH * 1.4), int(CARD_HEIGHT * 1.4))
         if self.card_back:
             preview_img = pygame.transform.scale(self.card_back, preview_size)
-            preview_rect = preview_img.get_rect(topleft=(preview_x, preview_y))
+            preview_rect = preview_img.get_rect(center=(cx, sel_y))
             self.screen.blit(preview_img, preview_rect)
         else:
-            placeholder_rect = pygame.Rect(preview_x, preview_y, preview_size[0], preview_size[1])
-            pygame.draw.rect(self.screen, PLACEHOLDER_COLOR, placeholder_rect)
+            placeholder_rect = pygame.Rect(0, 0, *preview_size)
+            placeholder_rect.center = (cx, sel_y)
+            pygame.draw.rect(self.screen, PLACEHOLDER_COLOR, placeholder_rect, border_radius=6)
 
-        apply_rect = pygame.Rect(SCREEN_WIDTH // 2 - 220, SCREEN_HEIGHT - 100, 200, 60)
-        cancel_rect = pygame.Rect(SCREEN_WIDTH // 2 + 40, SCREEN_HEIGHT - 100, 200, 60)
+        # Left arrow
+        arr_w, arr_h = 44, 44
+        left_rect = pygame.Rect(cx - preview_size[0] // 2 - 60, sel_y - arr_h // 2, arr_w, arr_h)
+        right_rect = pygame.Rect(cx + preview_size[0] // 2 + 16, sel_y - arr_h // 2, arr_w, arr_h)
+        for rect, symbol in [(left_rect, "<"), (right_rect, ">")]:
+            color = CUSTOMIZE_HOVER_COLOR if rect.collidepoint(mouse_pos) else BUTTON_COLOR
+            pygame.draw.rect(self.screen, color, rect, border_radius=8)
+            sym = self.title_font.render(symbol, True, TEXT_COLOR)
+            self.screen.blit(sym, sym.get_rect(center=rect.center))
 
-        for rect, text in [(apply_rect, "Apply & Return"), (cancel_rect, "Cancel")]:
-            color = BUTTON_HOVER_COLOR if rect.collidepoint(mouse_pos) else BUTTON_COLOR
-            pygame.draw.rect(self.screen, color, rect, border_radius=10)
-            txt = self.font.render(text, True, TEXT_COLOR)
-            self.screen.blit(txt, txt.get_rect(center=rect.center))
+        # Theme counter e.g. "2 / 5"
+        if self.card_back_themes:
+            idx = self.card_back_themes.index(self.selected_card_theme) if self.selected_card_theme in self.card_back_themes else 0
+            counter = self.small_font.render(f"{idx + 1} / {len(self.card_back_themes)}", True, PLACEHOLDER_COLOR)
+            self.screen.blit(counter, counter.get_rect(center=(cx, sel_y + preview_size[1] // 2 + 50)))
+
+
+        back_rect = pygame.Rect(10, SCREEN_HEIGHT - 50, 150, 36)
+        color = BUTTON_HOVER_COLOR if back_rect.collidepoint(mouse_pos) else BUTTON_COLOR
+        pygame.draw.rect(self.screen, color, back_rect, border_radius=8)
+        txt = self.small_font.render("Back to Menu", True, TEXT_COLOR)
+        self.screen.blit(txt, txt.get_rect(center=back_rect.center))
+        credits_rect = pygame.Rect(SCREEN_WIDTH - 160, SCREEN_HEIGHT - 50, 150, 36)
+        color = BUTTON_HOVER_COLOR if credits_rect.collidepoint(mouse_pos) else BUTTON_COLOR
+        pygame.draw.rect(self.screen, color, credits_rect, border_radius=8)
+        self.screen.blit(self.small_font.render("Credits", True, TEXT_COLOR),
+                         self.small_font.render("Credits", True, TEXT_COLOR).get_rect(center=credits_rect.center))
 
     def render_lobby(self, background_path: str, player_name: str, room_name_field: InputField,
                      create_btn: UIElement, refresh_btn: UIElement, disconnect_btn: UIElement,
-                     rooms_list: List[Dict], waiting_message: Optional[str], rules_state: Dict[str, bool]) -> None:
+                     rooms_list: List[Dict], waiting_message: Optional[str], rules_state: Dict[str, bool], server_ip: str = None) -> None:
         try:
             self.background = pygame.image.load(background_path)
         except pygame.error:
@@ -628,6 +756,13 @@ class Renderer:
 
         title = self.title_font.render(f"Playing as: {player_name}", True, TEXT_COLOR)
         self.screen.blit(title, (50, 20))
+        # Show server info next to player info; show friendly name for public server
+        if server_ip:
+            if server_ip == "158.101.177.217":
+                server_text = self.title_font.render("on a Public server", True, TEXT_COLOR)
+            else:
+                server_text = self.title_font.render(f"on server: {server_ip}", True, TEXT_COLOR)
+            self.screen.blit(server_text, (50 + title.get_width() + 12, 20))
 
         mouse_pos = pygame.mouse.get_pos()
         create_btn.draw(self.screen, mouse_pos)
@@ -676,7 +811,7 @@ class Renderer:
         pc_label = self.font.render("Počet hráčov:", True, TEXT_COLOR)
         self.screen.blit(pc_label, (dlg_x + 30, dlg_y + 148))
         for i, val in enumerate([2, 3, 4]):
-            rect = pygame.Rect(dlg_x + 190 + i * 56, dlg_y + 145, 46, 30)
+            rect = pygame.Rect(dlg_x + 240 + i * 56, dlg_y + 145, 46, 30)
             is_selected = selected_max_players == val
             color = (0, 180, 0) if is_selected else (
                 CUSTOMIZE_HOVER_COLOR if rect.collidepoint(mouse_pos) else BUTTON_COLOR)
@@ -685,7 +820,7 @@ class Renderer:
             self.screen.blit(label, label.get_rect(center=rect.center))
 
         pygame.draw.line(self.screen, (70, 70, 70), (dlg_x + 20, dlg_y + 192), (dlg_x + dlg_w - 20, dlg_y + 192))
-        rules_title = self.font.render("Pravidlá / Úpravy:", True, TEXT_COLOR)
+        rules_title = self.font.render("Pravidlá / Nastavenia:", True, TEXT_COLOR)
         self.screen.blit(rules_title, (dlg_x + 30, dlg_y + 200))
         rule_labels = {
             "stack_sevens": "Prebíjanie sedmy sedmou",
@@ -694,6 +829,7 @@ class Renderer:
             "play_multiple_cards": "Hranie viacerých rovnakých kariet naraz",
             "hornik_changes_suit": "Horník mení farbu",
         }
+        # Tournament mode is rendered separately below the rules
         y = dlg_y + 228
         for key, text in rule_labels.items():
             chk_rect = pygame.Rect(dlg_x + 30, y + 1, 16, 16)
@@ -705,14 +841,23 @@ class Renderer:
 
         pygame.draw.line(self.screen, (70, 70, 70), (dlg_x + 20, dlg_y + 392), (dlg_x + dlg_w - 20, dlg_y + 392))
 
-        privacy_chk = pygame.Rect(dlg_x + 30, dlg_y + 404, 18, 18)
+        # Tournament mode checkbox
+        tourn_chk = pygame.Rect(dlg_x + 30, dlg_y + 398, 16, 16)
+        tourn_on = rules.get("tournament_mode", False)
+        pygame.draw.rect(self.screen, (0, 180, 0) if tourn_on else (180, 0, 0), tourn_chk, border_radius=4)
+        tourn_label = self.small_font.render("Turnajový mód (každé kolo -1 karta pre posledného)", True, TEXT_COLOR)
+        self.screen.blit(tourn_label, (dlg_x + 54, dlg_y + 397))
+
+        pygame.draw.line(self.screen, (70, 70, 70), (dlg_x + 20, dlg_y + 422), (dlg_x + dlg_w - 20, dlg_y + 422))
+
+        privacy_chk = pygame.Rect(dlg_x + 30, dlg_y + 434, 18, 18)
         pygame.draw.rect(self.screen, (0, 180, 0) if room_is_private else (120, 120, 120), privacy_chk, border_radius=4)
         privacy_label = self.font.render("Súkromná miestnosť (vyžaduje heslo)", True, TEXT_COLOR)
-        self.screen.blit(privacy_label, (dlg_x + 56, dlg_y + 403))
+        self.screen.blit(privacy_label, (dlg_x + 56, dlg_y + 433))
 
         pw_field = input_fields.get("room_password")
         old_pw_pos = pw_field.rect.topleft
-        pw_row_y = dlg_y + 436
+        pw_row_y = dlg_y + 466
         if room_is_private:
             pw_label = self.small_font.render("Heslo:", True, TEXT_COLOR)
             self.screen.blit(pw_label, (dlg_x + 30, pw_row_y))
@@ -811,7 +956,7 @@ class Renderer:
         pygame.draw.rect(self.screen, (80, 80, 100), dlg_rect, 2, border_radius=10)
 
         # Title
-        title = self.title_font.render("Zadaj heslo miestnosti", True, TEXT_COLOR)
+        title = self.title_font.render("Enter room password", True, TEXT_COLOR)
         self.screen.blit(title, title.get_rect(center=(x + w // 2, y + 30)))
 
         # Password input field
@@ -836,14 +981,67 @@ class Renderer:
         pygame.draw.rect(self.screen, join_color,   join_rect,   border_radius=6)
         pygame.draw.rect(self.screen, cancel_color, cancel_rect, border_radius=6)
 
-        join_lbl   = self.font.render("Pripojiť sa", True, TEXT_COLOR)
-        cancel_lbl = self.font.render("Zrušiť",      True, TEXT_COLOR)
+        join_lbl   = self.font.render("Join", True, TEXT_COLOR)
+        cancel_lbl = self.font.render("Cancel",      True, TEXT_COLOR)
         self.screen.blit(join_lbl,   join_lbl.get_rect(center=join_rect.center))
         self.screen.blit(cancel_lbl, cancel_lbl.get_rect(center=cancel_rect.center))
 
         # Store button rects on ui_elements so the click handler can use them
         ui_elements["join_room_btn"].rect  = join_rect
         ui_elements["cancel_join"].rect    = cancel_rect
+
+    def render_credits(self, mouse_pos: Tuple[int, int]) -> None:
+        self._draw_background()
+        title = self.title_font.render("Credits & Asset Sources", True, TEXT_COLOR)
+        self.screen.blit(title, title.get_rect(center=(SCREEN_WIDTH // 2, 80)))
+
+        entries = [
+            ("Cards",        "Saxonian pattern — Wikimedia Commons",
+             "https://commons.wikimedia.org/wiki/Category:Saxon_pattern"),
+            ("Suit symbols", "German-suited playing cards — Wikipedia",
+             "https://en.wikipedia.org/wiki/German-suited_playing_cards"),
+            ("Backgrounds",  "Generated with AI", ""),
+            ("Card backs",   "Generated with AI, Freepik",
+             ["https://www.freepik.com"]),
+        ]
+        y = 200
+        for category, description, url in entries:
+            cat_surf = self.font.render(category + ":", True, HIGHLIGHT_COLOR)
+            self.screen.blit(cat_surf, cat_surf.get_rect(midright=(SCREEN_WIDTH // 2 - 20, y)))
+            desc_surf = self.font.render(description, True, TEXT_COLOR)
+            self.screen.blit(desc_surf, desc_surf.get_rect(midleft=(SCREEN_WIDTH // 2 - 10, y)))
+            urls = url if isinstance(url, list) else ([url] if url else [])
+            for ui, u in enumerate(urls):
+                url_rect = pygame.Rect(SCREEN_WIDTH // 2 - 10, y + 28 + ui * 24, 700, 22)
+                url_color = HIGHLIGHT_COLOR if url_rect.collidepoint(mouse_pos) else PLACEHOLDER_COLOR
+                url_surf = self.small_font.render(u, True, url_color)
+                self.screen.blit(url_surf, (SCREEN_WIDTH // 2 - 10, y + 28 + ui * 24))
+                if url_rect.collidepoint(mouse_pos):
+                    pygame.draw.line(self.screen, url_color,
+                                     (url_rect.x, url_rect.bottom),
+                                     (url_rect.x + url_surf.get_width(), url_rect.bottom), 1)
+            y += 100
+
+        back_rect = pygame.Rect(10, SCREEN_HEIGHT - 50, 150, 36)
+        color = BUTTON_HOVER_COLOR if back_rect.collidepoint(mouse_pos) else BUTTON_COLOR
+        pygame.draw.rect(self.screen, color, back_rect, border_radius=8)
+        self.screen.blit(self.small_font.render("Back", True, TEXT_COLOR),
+                         self.small_font.render("Back", True, TEXT_COLOR).get_rect(center=back_rect.center))
+        hint = self.small_font.render("Click a link to copy to clipboard", True, PLACEHOLDER_COLOR)
+        self.screen.blit(hint, hint.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT - 40)))
+
+        # Custom assets info
+        info_lines = [
+            "Custom backgrounds (1280x720 px) go in:  assets/backgrounds/",
+            "Custom card backs (80x142 px) go in:  assets/cards/card_backs/",
+        ]
+        iy = SCREEN_HEIGHT - 130
+        sep = self.small_font.render("─" * 80, True, PLACEHOLDER_COLOR)
+        self.screen.blit(sep, sep.get_rect(center=(SCREEN_WIDTH // 2, iy - 14)))
+        for line in info_lines:
+            s = self.small_font.render(line, True, TEXT_COLOR)
+            self.screen.blit(s, s.get_rect(center=(SCREEN_WIDTH // 2, iy)))
+            iy += 26
 
     def render_game(self, state_manager: StateManager, card_sprites: Dict[int, pygame.sprite.Group],
                     current_room_name: str, mouse_pos: Tuple[int, int],
@@ -865,20 +1063,52 @@ class Renderer:
                 wait_text = self.title_font.render(state_manager.waiting_message, True, TEXT_COLOR)
                 self.screen.blit(wait_text, wait_text.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 - 100)))
 
-            players_title = self.font.render("Players in room:", True, TEXT_COLOR)
-            self.screen.blit(players_title, players_title.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 - 20)))
+            # (Players in room title rendered inside the split-column block below)
+
+            # Split screen: players left, rules right
+            col_left = SCREEN_WIDTH // 3
+            col_right = SCREEN_WIDTH * 2 // 3
 
             if state_manager.player_names:
                 y = SCREEN_HEIGHT // 2 + 30
                 for slot, name in sorted(state_manager.player_names.items()):
                     color = HIGHLIGHT_COLOR if slot == state_manager.local_player else TEXT_COLOR
                     player_text = self.font.render(f"Player {slot + 1}: {name}", True, color)
-                    self.screen.blit(player_text, player_text.get_rect(center=(SCREEN_WIDTH // 2, y)))
+                    self.screen.blit(player_text, player_text.get_rect(center=(col_left, y)))
                     y += 40
                 if getattr(state_manager, 'current_room_password', None):
                     pw_surf = self.small_font.render(f"Password: {state_manager.current_room_password}", True,
                                                      TEXT_COLOR)
-                    self.screen.blit(pw_surf, pw_surf.get_rect(center=(SCREEN_WIDTH // 2, y + 20)))
+                    self.screen.blit(pw_surf, pw_surf.get_rect(center=(col_left, y + 20)))
+
+            # Rules panel on the right
+            rules = getattr(state_manager, "room_rules", {})
+            if rules:
+                rule_label_map = [
+                    ("stack_sevens",              "Prebíjanie sedmy sedmou"),
+                    ("zeleny_niznik_prebija_sedmu","Zelený dolník prebíja sedmu"),
+                    ("stack_aces",                "Prebíjanie esa esom"),
+                    ("play_multiple_cards",        "Hranie viacerých kariet naraz"),
+                    ("hornik_changes_suit",        "Horník mení farbu"),
+                    ("tournament_mode",            "Turnajový mód"),
+                ]
+                rules_title = self.font.render("Pravidlá:", True, TEXT_COLOR)
+                self.screen.blit(rules_title, rules_title.get_rect(center=(col_right, SCREEN_HEIGHT // 2 - 20)))
+                ry = SCREEN_HEIGHT // 2 + 30
+                for key, label in rule_label_map:
+                    val = rules.get(key, False)
+                    box_color = (60, 180, 60) if val else (180, 50, 50)
+                    box_rect = pygame.Rect(0, 0, 18, 18)
+                    box_rect.centery = ry
+                    box_rect.right = col_right - 160
+                    pygame.draw.rect(self.screen, box_color, box_rect, border_radius=3)
+                    rule_surf = self.font.render(label, True, TEXT_COLOR)
+                    self.screen.blit(rule_surf, rule_surf.get_rect(midleft=(box_rect.right + 10, ry)))
+                    ry += 38
+
+            # Move players title to match left column
+            players_title2 = self.font.render("Players in room:", True, TEXT_COLOR)
+            self.screen.blit(players_title2, players_title2.get_rect(center=(col_left, SCREEN_HEIGHT // 2 - 20)))
 
         elif state_manager.state == "playing" and state_manager.game_state and state_manager.local_player is not None:
             current_player = state_manager.game_state.get("current_player", 0)
@@ -921,6 +1151,9 @@ class Renderer:
                                            (dx + CARD_WIDTH + 26, dy + CARD_HEIGHT // 2), 18)
 
             for i in range(state_manager.num_players):
+                # Skip slots with no player (empty seats)
+                if i not in player_names:
+                    continue
                 pos_index = (i - state_manager.local_player) % state_manager.num_players
                 name_pos = self.layout.name_positions[pos_index]
                 name_color = HIGHLIGHT_COLOR if i == current_player else TEXT_COLOR
@@ -937,11 +1170,11 @@ class Renderer:
                 cards_played = state_manager.game_state.get("cards_played_this_turn", 0)
 
                 if seven_penalty > 0 and cards_played == 0:
-                    msg = f"Musíš ťahať {seven_penalty} kariet alebo prebiť!"
+                    msg = f"Ťahaj {seven_penalty} kariet alebo prebi!"
                     msg_surf = self.title_font.render(msg, True, ERROR_COLOR)
                     self.screen.blit(msg_surf, msg_surf.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 100)))
                 elif ace_penalty and cards_played == 0:
-                    msg = "Stojíš! Prebi Eso alebo preskoč ťah."
+                    msg = "Stojíš! Prebi eso alebo preskoč ťah."
                     msg_surf = self.title_font.render(msg, True, ERROR_COLOR)
                     self.screen.blit(msg_surf, msg_surf.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 100)))
 
@@ -968,22 +1201,59 @@ class Renderer:
                            leave_btn: UIElement) -> None:
         self._draw_background()
 
-        title = self.title_font.render("Game Over", True, TEXT_COLOR)
+        is_tournament_round = getattr(state_manager, 'tournament_round_over', False)
+
+        if is_tournament_round:
+            title_text = f"Round {getattr(state_manager, 'tournament_round', 1)} Over"
+            sub_text = "Next round starting soon..."
+        else:
+            title_text = "Game Over"
+            sub_text = None
+
+        title = self.title_font.render(title_text, True, TEXT_COLOR)
         self.screen.blit(title, title.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 4)))
 
-        if state_manager.leaderboard_data:
-            for i, entry in enumerate(state_manager.leaderboard_data):
+        if sub_text:
+            sub = self.small_font.render(sub_text, True, PLACEHOLDER_COLOR)
+            self.screen.blit(sub, sub.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 4 + 40)))
+
+        data = (getattr(state_manager, 'tournament_results', None)
+                if is_tournament_round else state_manager.leaderboard_data)
+
+        if data:
+            penalties = getattr(state_manager, 'tournament_penalties', {})
+            for i, entry in enumerate(data):
                 player_id = entry.get("pid", 0)
                 rank = entry.get("rank", i + 1)
                 player_name = state_manager.player_names.get(player_id, f"Unknown ({player_id + 1})")
                 disconnected = entry.get("disconnected", False)
+                is_local = (player_id == state_manager.local_player)
+                eliminated = entry.get("eliminated", False)
+                cards_next = entry.get("cards_next", None)
 
-                text = f"{rank}. {player_name}" + (" (disconnected)" if disconnected else "")
-                text_surface = self.font.render(text, True, TEXT_COLOR)
+                if eliminated:
+                    color = (150, 150, 150)
+                    suffix = " — eliminated"
+                elif disconnected:
+                    color = (150, 150, 150)
+                    suffix = " (disconnected)"
+                elif is_local:
+                    color = ERROR_COLOR
+                    suffix = ""
+                else:
+                    color = TEXT_COLOR
+                    suffix = ""
+
+                if is_tournament_round and cards_next is not None and not eliminated:
+                    suffix += f"  →  {cards_next} card(s) next round"
+
+                text = f"{rank}. {player_name}{suffix}"
+                text_surface = self.font.render(text, True, color)
                 self.screen.blit(text_surface,
                                  text_surface.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 3 + (i + 1) * 50)))
 
-        leave_btn.draw(self.screen, mouse_pos)
+        if not is_tournament_round:
+            leave_btn.draw(self.screen, mouse_pos)
 
 
 class EventHandler:
@@ -1015,11 +1285,13 @@ class EventHandler:
             "zeleny_niznik_prebija_sedmu": True,
             "stack_aces": True,
             "play_multiple_cards": True,
-            "hornik_changes_suit": True
+            "hornik_changes_suit": True,
+            "tournament_mode": False
         }
         self.room_is_private: bool = False
         self.pending_join_room_id = None
         self.current_room_password = None
+        self.is_leader: bool = False
         self.animation_manager: AnimationManager = AnimationManager()
         self._prev_hand_sizes: Dict[int, int] = {}
         # Stores (card, rect_x, rect_y, angle) of card waiting for server confirmation
@@ -1043,12 +1315,14 @@ class EventHandler:
         handlers = {
             "menu": self._handle_menu_click,
             "customize": self._handle_customize_click,
+            "credits": self._handle_credits_click,
             "lobby": self._handle_lobby_click,
             "create_room": self._handle_create_room_click,
             "join_password": self._handle_join_password_click,
             "room_waiting": self._handle_room_waiting_click,
             "playing": self._handle_game_click,
             "leaderboard": self._handle_leaderboard_click,
+            "public_menu": self._handle_public_menu_click,
         }
         handler = handlers.get(state)
         if handler:
@@ -1077,7 +1351,38 @@ class EventHandler:
         elif self.ui_elements["lan_server"].rect.collidepoint(pos):
             self._toggle_lan_server()
         elif self.ui_elements["public_server"].rect.collidepoint(pos):
+            # Open Public Server screen instead of immediate connect
+            # If LAN server is running, stop it so public lobby doesn't conflict
+            if getattr(self, 'lan_server', None) and self.lan_server.running:
+                self._toggle_lan_server()
+            self.state_manager.state = "public_menu"
+
+    def _handle_public_menu_click(self, pos: Tuple[int, int]) -> None:
+        name_field = self.input_fields["name"]
+
+        # Name field activation
+        if name_field.rect.collidepoint(pos):
+            name_field.active = True
+        else:
+            name_field.active = False
+
+        # Buttons
+        if self.ui_elements["connect"].rect.collidepoint(pos):
+            # Attempt to connect to the public server
             self._connect_public_server()
+            return
+        if self.ui_elements["close"].rect.collidepoint(pos):
+            raise SystemExit(0)
+        if self.ui_elements["customize"].rect.collidepoint(pos):
+            self.state_manager.state = "customize"
+            return
+        if self.ui_elements.get("back_to_lan") and self.ui_elements["back_to_lan"].rect.collidepoint(pos):
+            # Return to normal menu where LAN controls are shown
+            # Clear IP input so LAN menu starts with empty IP field
+            self.input_fields["ip"].text = ""
+            self.state_manager.server_ip = None
+            self.state_manager.state = "menu"
+            return
 
     def _toggle_lan_server(self) -> None:
         btn = self.ui_elements["lan_server"]
@@ -1085,15 +1390,15 @@ class EventHandler:
             self.lan_server.stop()
             btn.update_text("Start LAN Server")
             btn.bg_color = LAN_INACTIVE_COLOR
-            self.state_manager.waiting_message = "LAN server stopped"
+            self.state_manager.waiting_message = None
         else:
             if self.lan_server.start():
                 btn.update_text("Stop LAN Server")
                 btn.bg_color = LAN_ACTIVE_COLOR
-                self.state_manager.waiting_message = f"LAN server started on {self.lan_server.local_ip}:{PORT}"
+                self.state_manager.waiting_message = None
                 self.input_fields["ip"].text = self.lan_server.local_ip
             else:
-                self.state_manager.waiting_message = "Failed to start LAN server"
+                self.state_manager.waiting_message = None
 
     def _connect_public_server(self) -> None:
         self.input_fields["ip"].text = "158.101.177.217"
@@ -1106,39 +1411,95 @@ class EventHandler:
             return
         self._handle_connect()
 
+    def _handle_credits_click(self, pos: Tuple[int, int]) -> None:
+        back_rect = pygame.Rect(10, SCREEN_HEIGHT - 50, 150, 36)
+        if back_rect.collidepoint(pos):
+            self.state_manager.state = "customize"
+            return
+        # (category, urls_list, base_y)
+        clickable = [
+            (200, ["https://commons.wikimedia.org/wiki/Category:Saxon_pattern"]),
+            (300, ["https://en.wikipedia.org/wiki/German-suited_playing_cards"]),
+            (400, []),
+            (500, ["https://www.freepik.com"]),
+        ]
+        for base_y, urls in clickable:
+            for ui, url in enumerate(urls):
+                url_rect = pygame.Rect(SCREEN_WIDTH // 2 - 10, base_y + 28 + ui * 24, 700, 22)
+                if url_rect.collidepoint(pos):
+                    try:
+                        import subprocess
+                        if sys.platform == "win32":
+                            subprocess.run("clip", input=url.encode(), check=True, shell=True)
+                        elif sys.platform == "darwin":
+                            subprocess.run("pbcopy", input=url.encode(), check=True)
+                        else:
+                            subprocess.run(["xclip", "-selection", "clipboard"],
+                                           input=url.encode(), check=True)
+                        self.state_manager.waiting_message = None
+                    except Exception:
+                        self.state_manager.waiting_message = None
+                    return
+
     def _handle_customize_click(self, pos: Tuple[int, int]) -> None:
-        y = 210
-        for bg in self.renderer.background_options:
-            rect = pygame.Rect(100, y, 340, 45)
-            if rect.collidepoint(pos):
-                self.renderer.selected_background = bg
-                self.renderer.current_background_path = f"assets/backgrounds/{bg}"
+        global SCREEN_WIDTH, SCREEN_HEIGHT
+        # Arrow selector for background
+        bgs = self.renderer.background_options
+        if bgs:
+            bcx = SCREEN_WIDTH // 4
+            bsel_y = 290
+            bleft_rect  = pygame.Rect(bcx - 80, bsel_y - 22, 44, 44)
+            bright_rect = pygame.Rect(bcx + 36, bsel_y - 22, 44, 44)
+            cur_bg = self.renderer.selected_background
+            bidx = bgs.index(cur_bg) if cur_bg in bgs else 0
+            if bleft_rect.collidepoint(pos):
+                bidx = (bidx - 1) % len(bgs)
+            elif bright_rect.collidepoint(pos):
+                bidx = (bidx + 1) % len(bgs)
+            else:
+                bidx = None
+            if bidx is not None:
+                self.renderer.selected_background = bgs[bidx]
+                self.renderer.current_background_path = f"assets/backgrounds/{bgs[bidx]}"
                 self.renderer.load_assets(
                     self.renderer.current_background_path,
                     self.renderer.current_card_back_path,
                     (CARD_WIDTH, CARD_HEIGHT)
                 )
                 return
-            y += 55
 
-        y = 210
-        for theme in self.renderer.card_back_themes:
-            rect = pygame.Rect(SCREEN_WIDTH // 2 + 30, y, 340, 45)
-            if rect.collidepoint(pos):
-                self.renderer.selected_card_theme = theme
-                self.renderer.current_card_back_path = os.path.join("assets", "cards", "card_backs", theme)
+        # Arrow selector for card back
+        themes = self.renderer.card_back_themes
+        if themes:
+            cx = SCREEN_WIDTH * 3 // 4
+            sel_y = 290
+            preview_size = (int(CARD_WIDTH * 1.4), int(CARD_HEIGHT * 1.4))
+            left_rect = pygame.Rect(cx - preview_size[0] // 2 - 60, sel_y - 22, 44, 44)
+            right_rect = pygame.Rect(cx + preview_size[0] // 2 + 16, sel_y - 22, 44, 44)
+            cur_idx = themes.index(self.renderer.selected_card_theme) if self.renderer.selected_card_theme in themes else 0
+            if left_rect.collidepoint(pos):
+                cur_idx = (cur_idx - 1) % len(themes)
+            elif right_rect.collidepoint(pos):
+                cur_idx = (cur_idx + 1) % len(themes)
+            else:
+                cur_idx = None
+            if cur_idx is not None:
+                self.renderer.selected_card_theme = themes[cur_idx]
+                self.renderer.current_card_back_path = os.path.join("assets", "cards", "card_backs", themes[cur_idx])
                 self.renderer.load_assets(
                     self.renderer.current_background_path,
                     self.renderer.current_card_back_path,
                     (CARD_WIDTH, CARD_HEIGHT)
                 )
                 return
-            y += 55
 
-        apply_rect = pygame.Rect(SCREEN_WIDTH // 2 - 220, SCREEN_HEIGHT - 100, 200, 60)
-        cancel_rect = pygame.Rect(SCREEN_WIDTH // 2 + 40, SCREEN_HEIGHT - 100, 200, 60)
-        if apply_rect.collidepoint(pos) or cancel_rect.collidepoint(pos):
+
+        back_rect = pygame.Rect(10, SCREEN_HEIGHT - 50, 150, 36)
+        if back_rect.collidepoint(pos):
             self.state_manager.state = "menu"
+        credits_rect = pygame.Rect(SCREEN_WIDTH - 160, SCREEN_HEIGHT - 50, 150, 36)
+        if credits_rect.collidepoint(pos):
+            self.state_manager.state = "credits"
 
     def _handle_lobby_click(self, pos: Tuple[int, int]) -> None:
         room_name_field = self.input_fields["room_name"]
@@ -1153,7 +1514,12 @@ class EventHandler:
             self.network.send_message({"t": "refresh_rooms"})
         elif self.ui_elements["disconnect"].rect.collidepoint(pos):
             self.network.disconnect()
-            self.state_manager.state = "menu"
+            # If connected to the public server, return to the Public Server screen;
+            # otherwise return to the normal menu.
+            if getattr(self.state_manager, 'server_ip', None) == "158.101.177.217":
+                self.state_manager.state = "public_menu"
+            else:
+                self.state_manager.state = "menu"
             self.state_manager.waiting_message = None
         else:
             room_name_field.active = False
@@ -1171,7 +1537,7 @@ class EventHandler:
         dlg_y = SCREEN_HEIGHT // 2 - dlg_h // 2
 
         rn_rect = pygame.Rect(dlg_x + 30, dlg_y + 92, dlg_w - 60, 36)
-        pw_row_y = dlg_y + 436
+        pw_row_y = dlg_y + 466
         pw_rect = pygame.Rect(dlg_x + 30, pw_row_y + 20, dlg_w - 60, 36)
 
         if rn_rect.collidepoint(pos):
@@ -1184,7 +1550,7 @@ class EventHandler:
             return
 
         for i, val in enumerate([2, 3, 4]):
-            rect = pygame.Rect(dlg_x + 190 + i * 56, dlg_y + 145, 46, 30)
+            rect = pygame.Rect(dlg_x + 240 + i * 56, dlg_y + 145, 46, 30)
             if rect.collidepoint(pos):
                 self.selected_max_players = val
                 self.renderer.selected_room_max_players = val
@@ -1205,7 +1571,12 @@ class EventHandler:
                 return
             y += 30
 
-        privacy_rect = pygame.Rect(dlg_x + 30, dlg_y + 404, 18, 18)
+        tourn_rect = pygame.Rect(dlg_x + 30, dlg_y + 398, 16, 16)
+        if tourn_rect.collidepoint(pos):
+            self.rules["tournament_mode"] = not self.rules.get("tournament_mode", False)
+            return
+
+        privacy_rect = pygame.Rect(dlg_x + 30, dlg_y + 434, 18, 18)
         if privacy_rect.collidepoint(pos):
             self.room_is_private = not getattr(self, 'room_is_private', False)
             return
@@ -1270,6 +1641,9 @@ class EventHandler:
     def _handle_room_waiting_click(self, pos: Tuple[int, int]) -> None:
         if self.ui_elements["leave_room"].rect.collidepoint(pos):
             self.network.send_message({"t": "leave_room"})
+        elif self.is_leader and self.ui_elements["start_game"].rect.collidepoint(pos):
+            if len(self.state_manager.player_names) >= 2:
+                self.network.send_message({"t": "start_game"})
 
     def _handle_join_password_click(self, pos: Tuple[int, int]) -> None:
         """
@@ -1369,10 +1743,13 @@ class EventHandler:
             self.network.send_message({"t": "leave_room"})
 
     def handle_key(self, event) -> None:
-        if self.state_manager.state == "menu":
+        if self.state_manager.state in ("menu", "public_menu"):
             handled = self.input_fields["ip"].handle_key(event) or self.input_fields["name"].handle_key(event)
             if handled and event.key == pygame.K_RETURN:
-                self._handle_connect()
+                if self.state_manager.state == "menu":
+                    self._handle_connect()
+                elif self.state_manager.state == "public_menu":
+                    self._connect_public_server()
         elif self.state_manager.state == "create_room":
             if self.input_fields["room_name"].handle_key(event) and event.key == pygame.K_RETURN:
                 self.input_fields["room_name"].active = False
@@ -1409,7 +1786,7 @@ class EventHandler:
                 password = self.input_fields["room_password"].text
                 room_id = getattr(self, 'pending_join_room_id', None)
                 if not room_id:
-                    self.state_manager.waiting_message = "No room selected"
+                    self.state_manager.waiting_message = None
                     self.state_manager.state = "lobby"
                     return
                 self.network.send_message({"t": "join_room", "room_id": room_id, "password": password})
@@ -1441,9 +1818,11 @@ class EventHandler:
 
         self.player_name = name
         if self.network.connect(ip):
-            self.state_manager.waiting_message = "Setting name..."
+            self.state_manager.waiting_message = None
             running_flag = [True]
             self.network.start_listener(running_flag, self._on_network_message)
+            # remember connected server IP for lobby display
+            self.state_manager.server_ip = ip
             self.network.send_message({"t": "set_name", "name": self.player_name})
         else:
             self.state_manager.waiting_message = f"Failed to connect to {ip}"
@@ -1467,7 +1846,8 @@ class EventHandler:
             self.state_manager.waiting_message = None
 
         elif msg_type == "server_disconnected":
-            self.state_manager.waiting_message = "Server disconnected. Returned to menu."
+            self.is_leader = False
+            self.state_manager.waiting_message = "Server disconnected."
             try:
                 self.network.disconnect()
             except Exception:
@@ -1480,6 +1860,7 @@ class EventHandler:
             self.state_manager.local_player = None
             self.card_sprites = {i: pygame.sprite.Group() for i in range(4)}
             self.state_manager.current_room_password = None
+            self.state_manager.server_ip = None
 
         elif msg_type == "name_set":
             self.player_name = message.get("name", self.player_name)
@@ -1499,7 +1880,10 @@ class EventHandler:
                 self.state_manager.player_names = {int(k): v for k, v in message["player_names"].items()}
             self.update_card_sprites()
             self.state_manager.state = "room_waiting"
-            self.state_manager.waiting_message = f"Joined room: {self.current_room_name}"
+            self.is_leader = message.get("is_leader", False)
+            self.state_manager.room_rules = dict(self.rules)
+            players_needed = message.get("max_players", self.state_manager.num_players) - len(self.state_manager.player_names)
+            self.state_manager.waiting_message = f"Waiting for {players_needed} more player(s)..."
             self.state_manager.current_room_password = getattr(self, 'current_room_password', None)
             self.current_room_password = None
 
@@ -1534,7 +1918,8 @@ class EventHandler:
             if "player_names" in message:
                 message["player_names"] = {int(k): v for k, v in message["player_names"].items()}
                 self.state_manager.player_names = message["player_names"]
-            self.state_manager.num_players = message.get("num_players", len(message.get("players", [])))
+            # Use actual player count (from player_names), not max slot count
+            self.state_manager.num_players = len(message.get("player_names", {})) or message.get("num_players", len(message.get("players", [])))
             prev_state = self.state_manager.state
             # Snapshot old hand sizes BEFORE updating state
             old_hand_sizes: Dict[int, int] = {}
@@ -1564,6 +1949,39 @@ class EventHandler:
                         self._trigger_play_animation(card, sx, sy, angle)
                     self._pending_play = None
 
+                # ── Detect plays by any player (animate cards played to discard)
+                new_players = message.get("players", [])
+                discard_pile = message.get("discard_pile", [])
+                for pi, hand in enumerate(new_players):
+                    old_size = old_hand_sizes.get(pi, len(hand))
+                    new_size = len(hand)
+                    if new_size < old_size:
+                        # local already handled via _pending_play
+                        if pi == self.state_manager.local_player:
+                            continue
+                        # Use top of discard pile as played card (best-effort)
+                        played_card_data = discard_pile[-1] if discard_pile else None
+                        pos_index = (pi - self.state_manager.local_player) % self.state_manager.num_players
+                        start_x, start_y, start_angle = self.layout.get_player_position(pos_index, old_size, old_size - 1, is_local=(pi == self.state_manager.local_player))
+                        if played_card_data:
+                            key = played_card_data.get("name")
+                            if key not in self.card_cache:
+                                try:
+                                    self.card_cache[key] = Card(key, played_card_data.get("value", 0), played_card_data.get("suit", ""))
+                                except Exception:
+                                    self.card_cache[key] = Card(key, 0, "")
+                            card_obj = self.card_cache.get(key)
+                        else:
+                            # Fallback to back image
+                            card_obj = Card("__back__", 0, "")
+                            if self.renderer.card_back:
+                                try:
+                                    card_obj.image = pygame.transform.scale(self.renderer.card_back, (CARD_WIDTH, CARD_HEIGHT))
+                                except Exception:
+                                    pass
+                        if card_obj:
+                            self._trigger_play_animation(card_obj, float(start_x), float(start_y), start_angle)
+
                 # ── Detect newly drawn cards ─────────────────────────────────
                 new_players = message.get("players", [])
                 drew_cards: List[Tuple[int, dict, int, int]] = []
@@ -1582,26 +2000,53 @@ class EventHandler:
         elif msg_type == "go":
             if "player_names" in message:
                 self.state_manager.player_names = {int(k): v for k, v in message["player_names"].items()}
-            self.state_manager.state = "leaderboard"
-            self.state_manager.leaderboard_data = message.get("results", [])
-            self.state_manager.leaderboard_start = time.time()
-            self.state_manager.game_state = None
-            self.card_sprites = {i: pygame.sprite.Group() for i in range(4)}
-            self.current_room_id = None
-            self.current_room_name = ""
+            # Sort: connected players first (by rank), disconnected last
+            results = message.get("results", [])
+            # Strip tournament-round fields — not relevant for final/normal leaderboard
+            for r in results:
+                r.pop("cards_next", None)
+            connected = [e for e in results if not e.get("disconnected", False)]
+            disconnected = [e for e in results if e.get("disconnected", False)]
+            self.state_manager.leaderboard_data = connected + disconnected
+            # Clear leftover tournament round state so leaderboard renders cleanly
+            self.state_manager.tournament_round_over = False
+            self.state_manager.tournament_results = None
             self.animation_manager.clear()
+            # Wait 2s before showing leaderboard — keep cards visible until then
+            self.state_manager.leaderboard_pending = True
+            self.state_manager.leaderboard_pending_start = time.time()
 
         elif msg_type == "back_to_lobby":
+            self.is_leader = False
             self.state_manager.state = "lobby"
             self.current_room_id = None
             self.current_room_name = ""
             self.state_manager.player_names = {}
-            self.state_manager.waiting_message = "Returned to lobby"
+            self.state_manager.waiting_message = None
             self.state_manager.current_room_password = None
+            # keep server_ip so lobby can show which server we're on (optional)
+            # If want cleared on back_to_lobby, uncomment next line
+            # self.state_manager.server_ip = None
+
+        elif msg_type == "you_are_leader":
+            self.is_leader = True
+
+        elif msg_type == "tournament_round_over":
+            self.state_manager.tournament_round_over = True
+            self.state_manager.tournament_results = message.get("results", [])
+            self.state_manager.tournament_round = message.get("round", 0)
+            self.state_manager.tournament_penalties = message.get("penalties", {})
+            self.state_manager.player_names = {int(k): v for k, v in message.get("player_names", {}).items()}
+            self.state_manager.leaderboard_pending = True
+            self.state_manager.leaderboard_pending_start = time.time()
 
         elif msg_type == "e":
             self._pending_play = None
-            self.state_manager.waiting_message = f"Error: {message.get('msg', 'Unknown error')}"
+            err_msg = message.get('msg', '')
+            if "name" in err_msg.lower() or "connect" in err_msg.lower():
+                self.state_manager.waiting_message = err_msg
+            else:
+                self.state_manager.waiting_message = None
 
     def _trigger_deal_animation(self) -> None:
         """Queue deal animations in round-robin: 1 card per player per round."""
@@ -1735,6 +2180,11 @@ class MultiRoomClient:
         self.font = pygame.font.SysFont("Times New Roman", 24)
         self.title_font = pygame.font.SysFont("Times New Roman", 36, bold=True)
         self.small_font = pygame.font.SysFont("Times New Roman", 18)
+        info = pygame.display.Info()
+        taskbar_margin = 85
+        global SCREEN_WIDTH, SCREEN_HEIGHT
+        SCREEN_WIDTH = info.current_w - 20
+        SCREEN_HEIGHT = info.current_h - taskbar_margin
         self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
         pygame.display.set_caption("Sedma bere tri")
 
@@ -1792,20 +2242,31 @@ class MultiRoomClient:
                 "Start LAN Server", self.font, LAN_INACTIVE_COLOR,
                 hover_color=(180, 80, 80)
             ),
+            # Public server button moved to top-right
             "public_server": UIElement(
-                pygame.Rect(cx - 115, cy + 120, 230, 45),
+                pygame.Rect(SCREEN_WIDTH - 230, 20, 210, 45),
                 "Public Server", self.font, (40, 100, 160),
                 hover_color=(60, 140, 220)
             ),
+            # Back to LAN button (used on Public Server screen)
+            "back_to_lan": UIElement(
+                pygame.Rect(SCREEN_WIDTH - 230, 20, 210, 45),
+                "Back to LAN", self.font, (40, 100, 160),
+                hover_color=(60, 140, 220)
+            ),
             "end_turn": UIElement(
-                pygame.Rect(cx + 80, SCREEN_HEIGHT - 60, 150, 40),
-                "Koniec Ťahu", self.font, (180, 80, 40), hover_color=(220, 100, 60)
+                pygame.Rect(SCREEN_WIDTH // 2 + 130, SCREEN_HEIGHT - 202, 110, 28),
+                "End Turn", self.small_font, BUTTON_COLOR
             ),
             "start_room": UIElement(pygame.Rect(50, 420, 200, 40), "Start Room", self.font, (0, 150, 0)),
+            "start_game": UIElement(
+                pygame.Rect(SCREEN_WIDTH // 2 - 75, SCREEN_HEIGHT // 2 + 280, 150, 44),
+                "Start Game", self.font, (0, 150, 0), hover_color=(0, 200, 0)
+            ),
             "cancel_create": UIElement(pygame.Rect(50, 470, 200, 40), "Cancel", self.font, (150, 0, 0)),
             # Join-password buttons — rects are set at render time by render_join_password()
-            "join_room_btn": UIElement(pygame.Rect(0, 0, 380, 38), "Pripojiť sa", self.font, (0, 130, 0)),
-            "cancel_join": UIElement(pygame.Rect(0, 0, 380, 38), "Zrušiť", self.font, (130, 30, 30)),
+            "join_room_btn": UIElement(pygame.Rect(0, 0, 380, 38), "Join", self.font, (0, 130, 0)),
+            "cancel_join": UIElement(pygame.Rect(0, 0, 380, 38), "Cancel", self.font, (130, 30, 30)),
         }
 
     def run(self) -> None:
@@ -1825,14 +2286,33 @@ class MultiRoomClient:
             while not self.network.message_queue.empty():
                 self.event_handler._on_network_message(self.network.message_queue.get())
 
+            if (getattr(self.state_manager, 'leaderboard_pending', False) and
+                    time.time() - self.state_manager.leaderboard_pending_start > 2.0):
+                self.state_manager.leaderboard_pending = False
+                self.state_manager.state = "leaderboard"
+                self.state_manager.leaderboard_start = time.time()
+                if not getattr(self.state_manager, 'tournament_round_over', False):
+                    self.state_manager.game_state = None
+                    self.event_handler.card_sprites = {i: pygame.sprite.Group() for i in range(4)}
+                    self.event_handler.current_room_id = None
+                    self.event_handler.current_room_name = ""
+
+            tourn_round = getattr(self.state_manager, 'tournament_round_over', False)
+            lb_duration = 4.0 if tourn_round else LEADERBOARD_DURATION
             if (self.state_manager.state == "leaderboard" and
-                    time.time() - self.state_manager.leaderboard_start > LEADERBOARD_DURATION):
-                self.network.send_message({"t": "leave_room"})
-                self.state_manager.state = "lobby"
-                self.event_handler.current_room_id = None
-                self.event_handler.current_room_name = ""
-                self.state_manager.leaderboard_data = None
-                self.state_manager.game_state = None
+                    time.time() - self.state_manager.leaderboard_start > lb_duration):
+                if getattr(self.state_manager, 'tournament_round_over', False):
+                    # Tournament round: hide leaderboard, stay in playing — server sends next gs
+                    self.state_manager.tournament_round_over = False
+                    self.state_manager.tournament_results = None
+                    self.state_manager.state = "playing"
+                else:
+                    self.network.send_message({"t": "leave_room"})
+                    self.state_manager.state = "lobby"
+                    self.event_handler.current_room_id = None
+                    self.event_handler.current_room_name = ""
+                    self.state_manager.leaderboard_data = None
+                    self.state_manager.game_state = None
 
             # Update animations
             self.event_handler.animation_manager.update(dt)
@@ -1860,6 +2340,17 @@ class MultiRoomClient:
             )
             self.ui_elements["customize"].draw(self.screen, mouse_pos)
 
+        elif state == "public_menu":
+            # Render Public Server screen (no IP field, shows name/connect/close/customize/back)
+            self.renderer.render_public_menu(
+                self.input_fields["name"],
+                self.ui_elements["connect"],
+                self.ui_elements["close"],
+                self.ui_elements["customize"],
+                self.ui_elements.get("back_to_lan"),
+                self.state_manager.waiting_message
+            )
+
         elif state == "lobby":
             self.renderer.render_lobby(
                 self.renderer.current_background_path,
@@ -1869,7 +2360,8 @@ class MultiRoomClient:
                 self.ui_elements["disconnect"],
                 self.event_handler.rooms_list,
                 self.state_manager.waiting_message,
-                self.event_handler.rules
+                self.event_handler.rules,
+                getattr(self.state_manager, 'server_ip', None)
             )
         elif state == "create_room":
             self.renderer.render_create_room(
@@ -1890,6 +2382,16 @@ class MultiRoomClient:
                 self.ui_elements["leave_room"],
                 self.ui_elements["end_turn"]
             )
+            if state == "room_waiting" and self.event_handler.is_leader:
+                enough_players = len(self.state_manager.player_names) >= 2
+                btn = self.ui_elements["start_game"]
+                if enough_players:
+                    btn.bg_color = (0, 150, 0)
+                    btn.hover_color = (0, 200, 0)
+                else:
+                    btn.bg_color = (80, 80, 80)
+                    btn.hover_color = (80, 80, 80)
+                btn.draw(self.screen, mouse_pos)
 
         elif state == "join_password":
             # Render lobby in background, then draw the password modal on top
@@ -1915,6 +2417,8 @@ class MultiRoomClient:
 
         elif state == "customize":
             self.renderer.render_customize(mouse_pos)
+        elif state == "credits":
+            self.renderer.render_credits(mouse_pos)
 
     def _cleanup(self) -> None:
         self.lan_server.stop()
