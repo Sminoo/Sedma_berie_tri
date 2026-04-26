@@ -1,5 +1,3 @@
-from asyncio import wait
-
 import pygame
 import socket
 import json
@@ -749,10 +747,15 @@ class Renderer:
                      create_btn: UIElement, refresh_btn: UIElement, disconnect_btn: UIElement,
                      rooms_list: List[Dict], waiting_message: Optional[str], rules_state: Dict[str, bool], server_ip: str = None) -> None:
         try:
-            self.background = pygame.image.load(background_path)
-        except pygame.error:
+            bg = pygame.image.load(background_path)
+            if bg.get_size() != (SCREEN_WIDTH, SCREEN_HEIGHT):
+                bg = pygame.transform.scale(bg, (SCREEN_WIDTH, SCREEN_HEIGHT))
+            self.background = bg
+        except Exception:
+            # keep existing background if loading/scaling fails
             pass
-        self.screen.blit(self.background, (0, 0))
+        # clear screen and draw current background (ensures no uncovered areas)
+        self._draw_background()
 
         title = self.title_font.render(f"Playing as: {player_name}", True, TEXT_COLOR)
         self.screen.blit(title, (50, 20))
