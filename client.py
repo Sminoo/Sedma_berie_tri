@@ -675,7 +675,8 @@ class Renderer:
             is_error = "error" in waiting_message.lower() or "please" in waiting_message.lower()
             msg_color = ERROR_COLOR if is_error else TEXT_COLOR
             msg_surface = self.font.render(waiting_message, True, msg_color)
-            self.screen.blit(msg_surface, msg_surface.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 80)))
+            # Keep message placement consistent with LAN menu to avoid overlap with Close button.
+            self.screen.blit(msg_surface, msg_surface.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 185)))
 
     def render_customize(self, mouse_pos: Tuple[int, int]) -> None:
         self._draw_background()
