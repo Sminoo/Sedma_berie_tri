@@ -20,6 +20,7 @@ import os
 import zlib
 import uuid
 import time
+import random
 import logging
 from logging.handlers import RotatingFileHandler
 from typing import Dict, List, Optional, Set
@@ -219,12 +220,26 @@ class GameRoom:
                           for i in range(self.max_players)}
             self.game.deal_cards(hand_sizes)
 
-        # Choose a random starting player among active (non-eliminated, present) slots
         occupied_slots = [i for i, p in enumerate(self.players)
                           if p and i not in self.tournament_eliminated]
         if occupied_slots:
-            self.game.current_player = random.choice(occupied_slots)
-            logger.info(f"Starting player for room '{self.room_name}' is Player {self.game.current_player + 1}")
+            if self.tournament_mode:
+                # Tournament: first round -> random start; subsequent rounds -> player after last loser
+                if self.tournament_round <= 1 or self.tournament_last_loser is None:
+                    self.game.current_player = random.choice(occupied_slots)
+                else:
+                    try:
+                        idx = occupied_slots.index(self.tournament_last_loser)
+                        next_idx = (idx + 1) % len(occupied_slots)
+                        self.game.current_player = occupied_slots[next_idx]
+                    except ValueError:
+                        # fall back to random if last loser not present/active
+                        self.game.current_player = random.choice(occupied_slots)
+                logger.info(f"Starting player for room '{self.room_name}' is Player {self.game.current_player + 1} (tournament_mode={self.tournament_mode}, round={self.tournament_round})")
+            else:
+                # Normal mode: random starting player among active slots
+                self.game.current_player = random.choice(occupied_slots)
+                logger.info(f"Starting player for room '{self.room_name}' is Player {self.game.current_player + 1}")
         self.finish_order = []
         self.disconnected = set()
         player_count = len([p for p in self.players if p])
@@ -345,6 +360,16 @@ class RoomManager:
                     "player_names": room.player_names,
                     "new_leader_sock_id": id(room.leader_sock)
                 }, server=server)
+                # In waiting room, refresh waiting text after someone leaves
+                if not room.game and not room.game_ended:
+                    players_count = len([p for p in room.players if p])
+                    self.broadcast_to_room(room_id, {
+                        "t": "waiting",
+                        "players_needed": max(0, room.max_players - players_count),
+                        "leader_sock_id": id(room.leader_sock),
+                        "rules": room.rules,
+                        "player_names": room.player_names
+                    }, server=server)
                 if room.leader_sock in room.sockets:
                     server.send_message(room.leader_sock, {"t": "you_are_leader"})
 
@@ -483,6 +508,8 @@ class RoomManager:
             # Last place gets a penalty
             if results:
                 loser_pid = results[-1]["pid"]
+                # Remember last round's loser for tournament start order logic
+                room.tournament_last_loser = loser_pid
                 if loser_pid not in room.tournament_eliminated:
                     current_penalty = room.tournament_penalties.get(loser_pid, 0)
                     new_penalty = current_penalty + 1
@@ -605,7 +632,8 @@ class MessageHandler:
                 self.server.send_message(sock, {
                     "t": "room_joined", "room_id": room_id, "room_name": room_name,
                     "player_slot": 0, "max_players": max_players, "player_names": {0: creator_name},
-                    "is_leader": True
+                    "is_leader": True,
+                    "rules": rules
                 })
                 self.lobby.broadcast(
                     {"t": "room_list_update", "rooms": self.rooms.get_available_rooms_info()},
@@ -633,15 +661,16 @@ class MessageHandler:
                 self.server.send_message(sock, {
                     "t": "room_joined", "room_id": room_id, "room_name": room.room_name,
                     "player_slot": slot, "max_players": room.max_players, "player_names": room.player_names,
-                    "is_leader": False
+                    "is_leader": False, "rules": room.rules
                 })
                 self.rooms.broadcast_to_room(room_id, {
                     "t": "player_joined", "player_name": player_name, "player_slot": slot,
-                    "players_count": players_count, "player_names": room.player_names
+                    "players_count": players_count, "player_names": room.player_names, "rules": room.rules
                 }, server=self.server)
                 # Never auto-start — leader must press Start Game
                 self.rooms.broadcast_to_room(room_id, {
-                    "t": "waiting", "players_needed": room.max_players - players_count
+                    "t": "waiting", "players_needed": room.max_players - players_count, "rules": room.rules,
+                    "player_names": room.player_names
                 }, server=self.server)
                 self.lobby.broadcast(
                     {"t": "room_list_update", "rooms": self.rooms.get_available_rooms_info()},

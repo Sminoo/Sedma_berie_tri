@@ -412,6 +412,7 @@ class StateManager:
         self.game_state: Optional[Dict] = None
         self.player_names: Dict[int, str] = {}
         self.num_players: int = 4
+        self.room_max_players: int = 4
         self.waiting_message: Optional[str] = None
         self.waiting_start: float = time.time()
         self.leaderboard_start: float = 0
@@ -497,14 +498,21 @@ class LanServerManager:
         # Stop embedded server if running
         if getattr(self, 'server_instance', None):
             try:
-                try:
-                    self.server_instance.server_socket.close()
-                except Exception:
-                    pass
-                try:
-                    self.server_instance.sel.close()
-                except Exception:
-                    pass
+                # Prefer graceful shutdown if available
+                if hasattr(self.server_instance, 'shutdown'):
+                    try:
+                        self.server_instance.shutdown()
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        self.server_instance.server_socket.close()
+                    except Exception:
+                        pass
+                    try:
+                        self.server_instance.sel.close()
+                    except Exception:
+                        pass
             finally:
                 self.server_instance = None
                 self.server_thread = None
@@ -1076,7 +1084,7 @@ class Renderer:
                 y = SCREEN_HEIGHT // 2 + 30
                 for slot, name in sorted(state_manager.player_names.items()):
                     color = HIGHLIGHT_COLOR if slot == state_manager.local_player else TEXT_COLOR
-                    player_text = self.font.render(f"Player {slot + 1}: {name}", True, color)
+                    player_text = self.font.render(f"{name}", True, color)
                     self.screen.blit(player_text, player_text.get_rect(center=(col_left, y)))
                     y += 40
                 if getattr(state_manager, 'current_room_password', None):
@@ -1359,6 +1367,9 @@ class EventHandler:
             if getattr(self, 'lan_server', None) and self.lan_server.running:
                 self._toggle_lan_server()
             self.state_manager.state = "public_menu"
+            # Clear any leftover waiting message (e.g., "Server disconnected.") when
+            # switching to the Public server screen so it doesn't persist there.
+            self.state_manager.waiting_message = None
 
     def _handle_public_menu_click(self, pos: Tuple[int, int]) -> None:
         name_field = self.input_fields["name"]
@@ -1878,15 +1889,19 @@ class EventHandler:
             self.current_room_id = message.get("room_id")
             self.current_room_name = message.get("room_name", "")
             self.state_manager.local_player = message.get("player_slot", 0)
+            self.state_manager.room_max_players = message.get("max_players", self.state_manager.room_max_players)
             self.state_manager.player_names[self.state_manager.local_player] = self.player_name
             if "player_names" in message:
                 self.state_manager.player_names = {int(k): v for k, v in message["player_names"].items()}
             self.update_card_sprites()
             self.state_manager.state = "room_waiting"
             self.is_leader = message.get("is_leader", False)
-            self.state_manager.room_rules = dict(self.rules)
-            players_needed = message.get("max_players", self.state_manager.num_players) - len(self.state_manager.player_names)
-            self.state_manager.waiting_message = f"Waiting for {players_needed} more player(s)..."
+            self.state_manager.room_rules = {k: v for k, v in message.get("rules", self.rules).items()}
+            players_needed = self.state_manager.room_max_players - len(self.state_manager.player_names)
+            if players_needed > 0:
+                self.state_manager.waiting_message = f"Waiting for {players_needed} more player(s)..."
+            else:
+                self.state_manager.waiting_message = None
             self.state_manager.current_room_password = getattr(self, 'current_room_password', None)
             self.current_room_password = None
 
@@ -1908,14 +1923,20 @@ class EventHandler:
                     self.state_manager.player_names.pop(k, None)
 
             if self.state_manager.state == "room_waiting":
-                players_needed = self.state_manager.num_players - len(self.state_manager.player_names)
-                self.state_manager.waiting_message = f"Waiting for {players_needed} more player(s)..."
+                players_needed = self.state_manager.room_max_players - len(self.state_manager.player_names)
+                if players_needed > 0:
+                    self.state_manager.waiting_message = f"Waiting for {players_needed} more player(s)..."
+                else:
+                    self.state_manager.waiting_message = None
 
         elif msg_type == "waiting":
             if "player_names" in message:
                 self.state_manager.player_names = {int(k): v for k, v in message["player_names"].items()}
             players_needed = message.get("players_needed", 0)
-            self.state_manager.waiting_message = f"Waiting for {players_needed} more player(s)..."
+            if players_needed > 0:
+                self.state_manager.waiting_message = f"Waiting for {players_needed} more player(s)..."
+            else:
+                self.state_manager.waiting_message = None
 
         elif msg_type == "gs":
             if "player_names" in message:
