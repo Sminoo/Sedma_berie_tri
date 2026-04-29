@@ -1,0 +1,2 @@
+https://github.com/Sminoo/Sedma_berie_tri
+v priečinku dist je spustiteľný Sedma bere tri.exe súbor hry
