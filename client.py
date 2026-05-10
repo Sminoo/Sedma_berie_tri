@@ -428,6 +428,7 @@ class StateManager:
         # Holds "go" data while waiting 2s before showing leaderboard
         self.leaderboard_pending: bool = False
         self.leaderboard_pending_start: float = 0
+        self.previous_state: Optional[str] = None
 
 
 class LanServerManager:
@@ -1359,6 +1360,7 @@ class EventHandler:
         elif self.ui_elements["close"].rect.collidepoint(pos):
             raise SystemExit(0)
         elif self.ui_elements["customize"].rect.collidepoint(pos):
+            self.state_manager.previous_state = self.state_manager.state
             self.state_manager.state = "customize"
         elif self.ui_elements["lan_server"].rect.collidepoint(pos):
             self._toggle_lan_server()
@@ -1389,6 +1391,7 @@ class EventHandler:
         if self.ui_elements["close"].rect.collidepoint(pos):
             raise SystemExit(0)
         if self.ui_elements["customize"].rect.collidepoint(pos):
+            self.state_manager.previous_state = self.state_manager.state
             self.state_manager.state = "customize"
             return
         if self.ui_elements.get("back_to_lan") and self.ui_elements["back_to_lan"].rect.collidepoint(pos):
@@ -1511,7 +1514,14 @@ class EventHandler:
 
         back_rect = pygame.Rect(10, SCREEN_HEIGHT - 50, 150, 36)
         if back_rect.collidepoint(pos):
-            self.state_manager.state = "menu"
+            # Return to the menu we came from (e.g. public_menu) if recorded,
+            # otherwise fall back to the main menu.
+            prev = getattr(self.state_manager, 'previous_state', None)
+            if prev:
+                self.state_manager.state = prev
+                self.state_manager.previous_state = None
+            else:
+                self.state_manager.state = "menu"
         credits_rect = pygame.Rect(SCREEN_WIDTH - 160, SCREEN_HEIGHT - 50, 150, 36)
         if credits_rect.collidepoint(pos):
             self.state_manager.state = "credits"
