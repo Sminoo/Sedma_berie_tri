@@ -10,7 +10,7 @@
 [Setup]
 ; NOTE: The value of AppId uniquely identifies this application. Do not use the same AppId value in installers for other applications.
 ; (To generate a new GUID, click Tools | Generate GUID inside the IDE.)
-AppId={{0AD0A38E-37D1-4221-8983-F8E42D89FD03}
+AppId={{24A7770F-7F34-41F7-AF6E-D20221ED4C48}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 ;AppVerName={#MyAppName} {#MyAppVersion}
@@ -28,7 +28,7 @@ ArchitecturesInstallIn64BitMode=x64compatible
 DisableProgramGroupPage=yes
 ; Uncomment the following line to run in non administrative install mode (install for current user only).
 ;PrivilegesRequired=lowest
-OutputBaseFilename=sedmaberetri_Setup
+OutputBaseFilename=mysetup
 SetupIconFile=C:\vsetkyMojePragramy\Sedma_berie_tri\zalud.ico
 SolidCompression=yes
 WizardStyle=modern dynamic
