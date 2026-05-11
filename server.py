@@ -402,18 +402,6 @@ class RoomManager:
                 "cards_left": cards_left, "disconnected": pid in room.disconnected
             })
 
-        if room.tournament_mode:
-            # Tournament ranking: survivor = rank 1, most penalised = last
-            # Sort by penalty ascending (fewer penalties = better rank)
-            all_pids = [r["pid"] for r in results]
-            all_pids.sort(key=lambda p: room.tournament_penalties.get(p, 0))
-            results = [{
-                "pid": p,
-                "rank": i + 1,
-                "cards_left": len(room.game.players[p]) if p < len(room.game.players) else 0,
-                "disconnected": p in room.disconnected
-            } for i, p in enumerate(all_pids)]
-
         winner_str = f"Player {winner + 1}" if winner is not None else "none"
         logger.info(f"Game over in room '{room.room_name}', winner: {winner_str}")
 
@@ -422,20 +410,28 @@ class RoomManager:
         room.finish_order = []
 
         if room.tournament_mode:
-            # Last place gets a penalty
+            # Apply penalty to last-place player FIRST, then rank
             if results:
                 loser_pid = results[-1]["pid"]
-                # Remember last round's loser for tournament start order logic
                 room.tournament_last_loser = loser_pid
                 if loser_pid not in room.tournament_eliminated:
-                    current_penalty = room.tournament_penalties.get(loser_pid, 0)
-                    new_penalty = current_penalty + 1
+                    new_penalty = room.tournament_penalties.get(loser_pid, 0) + 1
                     room.tournament_penalties[loser_pid] = new_penalty
                     cards_next = max(0, 5 - new_penalty)
                     logger.info(f"Tournament: Player {loser_pid + 1} penalty={new_penalty}, next hand={cards_next}")
                     if cards_next <= 0:
                         room.tournament_eliminated.add(loser_pid)
                         logger.info(f"Tournament: Player {loser_pid + 1} eliminated!")
+
+            # Now rank with updated penalties (fewest penalties = best rank)
+            all_pids = [r["pid"] for r in results]
+            all_pids.sort(key=lambda p: room.tournament_penalties.get(p, 0))
+            results = [{
+                "pid": p,
+                "rank": i + 1,
+                "cards_left": len(room.game.players[p]) if room.game and p < len(room.game.players) else 0,
+                "disconnected": p in room.disconnected
+            } for i, p in enumerate(all_pids)]
 
             # Count active (non-eliminated, still connected) players
             active = [i for i, p in enumerate(room.players)
